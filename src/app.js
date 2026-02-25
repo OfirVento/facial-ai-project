@@ -29,8 +29,8 @@ class FacialAIProject {
     this.voiceAgent = new VoiceAgent();
 
     // Pipeline
-    this.photoUploader = new PhotoUploader();
-    this.mediaPipeBridge = null; // initialized lazily when webcam needed
+    this.photoUploader = new PhotoUploader({ meshGenerator: this.meshGenerator });
+    this.mediaPipeBridge = null; // initialized lazily when needed
 
     // State
     this.flameLoaded = false; // true when real FLAME 2023 data is loaded
@@ -414,11 +414,19 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     // Generate button
     document.getElementById('generate-btn')?.addEventListener('click', async () => {
       const btn = document.getElementById('generate-btn');
-      btn.textContent = 'Generating...';
+      btn.textContent = 'Detecting face...';
       btn.disabled = true;
 
       try {
-        // Generate texture from photo
+        // Lazy-init MediaPipeBridge and pass to uploader
+        if (!this.mediaPipeBridge) {
+          this.mediaPipeBridge = new MediaPipeBridge();
+        }
+        this.photoUploader._mediaPipeBridge = this.mediaPipeBridge;
+
+        btn.textContent = 'Generating texture...';
+
+        // Generate texture from photo (uses piecewise affine warp if possible)
         const texture = await this.photoUploader.generateTextureFromPhoto();
         const normalMap = await this.photoUploader.generateNormalMapFromPhoto();
 
@@ -430,7 +438,7 @@ You can now modify specific regions — try saying "make my nose thinner" or use
           }
         }
 
-        this._addMessage('system', 'Photo texture applied to 3D model. You can now modify the face using chat or sliders.');
+        this._addMessage('system', 'Photo texture projected onto 3D model. You can now modify the face using chat or sliders.');
         btn.textContent = '✓ Generated';
       } catch (err) {
         console.error(err);

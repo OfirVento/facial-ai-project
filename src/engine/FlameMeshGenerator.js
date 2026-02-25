@@ -1512,6 +1512,31 @@ export class FlameMeshGenerator {
     return this._flameTemplateMeta ?? null;
   }
 
+  /** @returns {Float32Array|null} FLAME UV coordinates (5118×2 floats, u/v pairs in 0-1). */
+  get flameUVCoords() {
+    return this._flameUVCoords ?? null;
+  }
+
+  /** @returns {Uint32Array|null} FLAME UV face indices (9976×3, into UV vertex space). */
+  get flameUVFaces() {
+    return this._flameUVFaces ?? null;
+  }
+
+  /** @returns {Uint32Array|null} FLAME 3D face indices (9976×3, into position vertex space). */
+  get flameFaces() {
+    return this._flameFaces ?? null;
+  }
+
+  /** @returns {Uint32Array|null} Map from UV vertex index → position vertex index. */
+  get uvToPosMap() {
+    return this._uvToPosMap ?? null;
+  }
+
+  /** @returns {number} Number of UV vertices (5118 when UV data is loaded). */
+  get flameUVVertexCount() {
+    return this._flameUVVertexCount ?? 0;
+  }
+
   /** @returns {string[]} All 52 region names. */
   static get regionNames() {
     return Object.keys(REGION_META_DEFS);

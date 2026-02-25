@@ -809,6 +809,14 @@ export class MediaPipeBridge {
     return this._faceLandmarker !== null;
   }
 
+  /**
+   * @returns {object|null} FLAME-MediaPipe mapping data:
+   *   { landmark_indices: number[], lmk_face_idx: number[], lmk_b_coords: number[][] }
+   */
+  get flameMapping() {
+    return this._flameMapping ?? null;
+  }
+
   /** @returns {Readonly<typeof LANDMARK_DEFINITIONS>} Semantic landmark map */
   static get LANDMARK_DEFINITIONS() {
     return LANDMARK_DEFINITIONS;
