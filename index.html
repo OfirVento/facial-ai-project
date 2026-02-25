@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Facial AI Project — Clinical Consultation Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/ui/styles.css">
+</head>
+<body>
+  <div id="app" class="app-layout">
+
+    <!-- ==================== TOP BAR ==================== -->
+    <header class="top-bar">
+      <div class="top-bar-left">
+        <span class="logo">Facial<span class="logo-accent">AI</span></span>
+        <div class="phase-indicator" id="phase-indicator">
+          <span class="phase-dot active"></span>
+          <span class="phase-label">Upload Photos</span>
+        </div>
+        <div class="mode-tabs">
+          <button class="mode-tab active" data-mode="text">💬 Text</button>
+          <button class="mode-tab" data-mode="voice">🎤 Voice</button>
+          <button class="mode-tab" data-mode="live">🔴 Live</button>
+        </div>
+      </div>
+      <div class="top-bar-right">
+        <button class="top-btn" id="undo-btn" title="Undo (Ctrl+Z)">↩ Undo</button>
+        <button class="top-btn" id="redo-btn" title="Redo (Ctrl+Y)">↪ Redo</button>
+        <button class="top-btn" id="reset-btn" title="Reset all changes">⟳ Reset</button>
+        <button class="top-btn" id="save-btn" title="Save current version">💾 Save</button>
+        <button class="top-btn" id="compare-btn" title="Before/After comparison">⇔ Compare</button>
+        <button class="top-btn accent" id="report-btn" title="Generate report">📋 Report</button>
+      </div>
+    </header>
+
+    <!-- ==================== LEFT PANEL — Controls ==================== -->
+    <aside class="left-panel">
+      <!-- Photo Upload Section (shown first) -->
+      <div id="upload-section" class="panel-section">
+        <div class="panel-header">
+          <span>📸 Face Capture</span>
+          <button class="header-btn" id="toggle-upload">▼</button>
+        </div>
+        <div class="upload-grid" id="upload-grid">
+          <div class="upload-slot" data-angle="front">
+            <div class="upload-placeholder" id="upload-front">
+              <div class="upload-icon">👤</div>
+              <span>Front</span>
+              <span class="upload-hint">Required</span>
+            </div>
+            <input type="file" accept="image/*" class="upload-input" data-angle="front" hidden>
+          </div>
+          <div class="upload-slot" data-angle="left45">
+            <div class="upload-placeholder" id="upload-left45">
+              <div class="upload-icon">👤</div>
+              <span>Left 45°</span>
+              <span class="upload-hint">Optional</span>
+            </div>
+            <input type="file" accept="image/*" class="upload-input" data-angle="left45" hidden>
+          </div>
+          <div class="upload-slot" data-angle="right45">
+            <div class="upload-placeholder" id="upload-right45">
+              <div class="upload-icon">👤</div>
+              <span>Right 45°</span>
+              <span class="upload-hint">Optional</span>
+            </div>
+            <input type="file" accept="image/*" class="upload-input" data-angle="right45" hidden>
+          </div>
+        </div>
+        <button class="btn-primary" id="generate-btn" disabled>Generate 3D Model</button>
+
+        <!-- Reconstruction file upload (from Colab) -->
+        <div class="recon-upload">
+          <div class="divider-text">or load from DECA Colab</div>
+          <button class="btn-secondary" id="load-recon-btn">📁 Load Reconstruction Files</button>
+          <input type="file" id="recon-mesh-input" accept=".obj,.glb" hidden>
+          <input type="file" id="recon-texture-input" accept="image/*" hidden>
+          <input type="file" id="recon-normal-input" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <!-- Region Controls -->
+      <div id="controls-section" class="panel-section">
+        <div class="panel-header">
+          <span>🎛️ Region Controls</span>
+          <span class="change-badge" id="change-count">0</span>
+        </div>
+
+        <div class="region-tabs" id="region-tabs">
+          <button class="region-tab active" data-region="all">All</button>
+          <button class="region-tab" data-region="forehead">Forehead</button>
+          <button class="region-tab" data-region="eyes">Eyes</button>
+          <button class="region-tab" data-region="nose">Nose</button>
+          <button class="region-tab" data-region="cheeks">Cheeks</button>
+          <button class="region-tab" data-region="lips">Lips</button>
+          <button class="region-tab" data-region="jaw">Jaw</button>
+          <button class="region-tab" data-region="skin">Skin</button>
+        </div>
+
+        <div id="region-controls" class="region-controls-list">
+          <!-- Dynamically populated -->
+        </div>
+      </div>
+
+      <!-- Versions -->
+      <div id="versions-section" class="panel-section compact">
+        <div class="panel-header">
+          <span>📂 Versions</span>
+        </div>
+        <div id="versions-list" class="versions-list">
+          <span class="empty-state">No saved versions</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ==================== CENTER — 3D Viewport ==================== -->
+    <main class="center-panel">
+      <div id="face-viewport">
+        <!-- Expression bar -->
+        <div class="expression-bar">
+          <button class="expr-btn" data-expression="smile">😊 Smile</button>
+          <button class="expr-btn" data-expression="big_smile">😄 Big Smile</button>
+          <button class="expr-btn" data-expression="frown">😟 Frown</button>
+          <button class="expr-btn" data-expression="surprise">😮 Surprise</button>
+          <button class="expr-btn" data-expression="talking">🗣️ Talking</button>
+          <button class="expr-btn" data-expression="laugh">😆 Laugh</button>
+        </div>
+
+        <!-- Active region indicator -->
+        <div class="region-indicator" id="region-indicator" style="display:none">
+          <span id="region-indicator-text"></span>
+        </div>
+
+        <!-- Viewport hint -->
+        <span class="viewport-hint" id="viewport-hint">Drag to rotate · Scroll to zoom · Double-click to reset</span>
+
+        <!-- View controls -->
+        <div class="viewport-controls">
+          <button class="view-btn active" data-view="front">Front</button>
+          <button class="view-btn" data-view="three-quarter-left">¾ L</button>
+          <button class="view-btn" data-view="three-quarter-right">¾ R</button>
+          <button class="view-btn" data-view="profile-left">Profile L</button>
+          <button class="view-btn" data-view="profile-right">Profile R</button>
+          <button class="view-btn" data-view="above">Above</button>
+          <button class="view-btn" data-view="below">Below</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- ==================== RIGHT PANEL — Chat ==================== -->
+    <aside class="right-panel">
+      <div class="panel-header">
+        <span>💬 Consultation Chat</span>
+      </div>
+
+      <div id="chat-messages" class="chat-messages">
+        <!-- Messages populated dynamically -->
+      </div>
+
+      <div id="thinking-indicator" class="thinking-indicator" style="display:none">
+        <div class="thinking-dots"><span></span><span></span><span></span></div>
+        <span>AI is processing...</span>
+      </div>
+
+      <div id="interim-transcript" class="interim-transcript" style="display:none"></div>
+
+      <div class="chat-input-area">
+        <textarea id="chat-input"
+          placeholder="Describe what you'd like to change... (e.g., 'make my nose thinner' or 'add subtle lip filler to the right side')"
+          rows="2"></textarea>
+        <div class="chat-buttons">
+          <button id="send-btn" class="btn-send">Send</button>
+          <button id="voice-btn" class="btn-voice">🎤</button>
+        </div>
+      </div>
+
+      <!-- Quick actions -->
+      <div class="quick-actions">
+        <button class="quick-btn" data-prompt="make my nose thinner">Nose thinner</button>
+        <button class="quick-btn" data-prompt="add lip filler">Lip filler</button>
+        <button class="quick-btn" data-prompt="lift cheekbones">Lift cheekbones</button>
+        <button class="quick-btn" data-prompt="define jawline">Jawline</button>
+        <button class="quick-btn" data-prompt="reduce nasolabial folds">Nasolabial</button>
+        <button class="quick-btn" data-prompt="what procedures do I need">Procedures?</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Report Modal -->
+  <div id="report-modal" class="modal" style="display:none">
+    <div class="modal-content report-content" id="report-content">
+      <!-- Populated dynamically -->
+    </div>
+  </div>
+
+  <script type="module" src="/src/app.js"></script>
+</body>
+</html>
