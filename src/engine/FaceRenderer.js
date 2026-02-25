@@ -647,8 +647,15 @@ export class FaceRenderer {
     const pos = geo.attributes.position;
     const norm = geo.attributes.normal;
 
+    // Compute mesh-proportional scale: inflate values (-0.5..+0.5) should
+    // produce displacements proportional to the mesh's bounding radius,
+    // not absolute world-space units.
+    const meshRadius = this._meshBoundingRadius || 0.085;
+    const INFLATE_SCALE = meshRadius * 0.15; // max slider → ~7.5% of radius
+
     // --- inflate: push vertices along their normals ---
     if (params.inflate && norm) {
+      const amount = params.inflate * INFLATE_SCALE;
       for (const idx of vertexIndices) {
         if (idx < 0 || idx >= pos.count) continue;
         const nx = norm.getX(idx);
@@ -656,23 +663,25 @@ export class FaceRenderer {
         const nz = norm.getZ(idx);
         pos.setXYZ(
           idx,
-          pos.getX(idx) + nx * params.inflate,
-          pos.getY(idx) + ny * params.inflate,
-          pos.getZ(idx) + nz * params.inflate,
+          pos.getX(idx) + nx * amount,
+          pos.getY(idx) + ny * amount,
+          pos.getZ(idx) + nz * amount,
         );
       }
     }
 
     // --- translate ---
     if (params.translate) {
-      const t = params.translate;
+      const tx = (params.translate.x || 0) * INFLATE_SCALE;
+      const ty = (params.translate.y || 0) * INFLATE_SCALE;
+      const tz = (params.translate.z || 0) * INFLATE_SCALE;
       for (const idx of vertexIndices) {
         if (idx < 0 || idx >= pos.count) continue;
         pos.setXYZ(
           idx,
-          pos.getX(idx) + (t.x || 0),
-          pos.getY(idx) + (t.y || 0),
-          pos.getZ(idx) + (t.z || 0),
+          pos.getX(idx) + tx,
+          pos.getY(idx) + ty,
+          pos.getZ(idx) + tz,
         );
       }
     }
@@ -1073,6 +1082,12 @@ export class FaceRenderer {
     this._sphericalTarget.theta = 0;
     this._sphericalTarget.phi = Math.PI / 2;
     this._applyCameraSpherical(this._spherical);
+
+    // Store mesh bounding radius for proportional deformation scaling
+    geometry.computeBoundingSphere();
+    this._meshBoundingRadius = geometry.boundingSphere
+      ? geometry.boundingSphere.radius
+      : 0.085;
   }
 
   /**

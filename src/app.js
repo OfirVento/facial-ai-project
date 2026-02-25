@@ -266,10 +266,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     this.morphState[regionName][key] = value;
 
     if (this.renderer && this.meshData) {
-      const vertices = this.meshData.regions[regionName];
-      if (vertices) {
-        this.renderer.deformRegion(vertices, this.morphState[regionName]);
-      }
+      // Use applyMorphState to reset geometry first, then apply all regions fresh.
+      // This avoids cumulative deformation errors from bare deformRegion() calls.
+      this.renderer.applyMorphState(this.morphState, this.meshData.regions);
     }
 
     this._saveMorphHistory();
