@@ -191,7 +191,12 @@ export class PhotoUploader {
   // -----------------------------------------------------------------------
 
   /**
-   * Warp the photo into FLAME UV space using piecewise affine transformation.
+   * Project the photo onto FLAME UV space using camera projection.
+   *
+   * 1. Solve an affine 3D→2D camera from 105 landmark correspondences
+   * 2. Project all FLAME template vertices to image space
+   * 3. Rasterise every FLAME UV face: for each UV pixel, map to image via
+   *    barycentric interpolation of the projected vertex positions.
    */
   _warpTextureToUV(img, landmarks, mapping, meshGen) {
     const size = 1024;
@@ -200,51 +205,87 @@ export class PhotoUploader {
     canvas.height = size;
     const ctx = canvas.getContext('2d');
 
-    // 1. Draw source image onto a temp canvas for pixel sampling
-    const maxSrc = 2048; // cap for performance
-    const scale = Math.min(1, maxSrc / Math.max(img.naturalWidth, img.naturalHeight));
-    const srcW = Math.round(img.naturalWidth * scale);
-    const srcH = Math.round(img.naturalHeight * scale);
+    // --- source image ---
+    const maxSrc = 2048;
+    const sc = Math.min(1, maxSrc / Math.max(img.naturalWidth, img.naturalHeight));
+    const srcW = Math.round(img.naturalWidth * sc);
+    const srcH = Math.round(img.naturalHeight * sc);
     const srcCanvas = document.createElement('canvas');
     srcCanvas.width = srcW;
     srcCanvas.height = srcH;
-    const srcCtx = srcCanvas.getContext('2d');
-    srcCtx.drawImage(img, 0, 0, srcW, srcH);
-    const srcImageData = srcCtx.getImageData(0, 0, srcW, srcH);
+    srcCanvas.getContext('2d').drawImage(img, 0, 0, srcW, srcH);
+    const srcData = srcCanvas.getContext('2d').getImageData(0, 0, srcW, srcH).data;
 
-    // 2. Build control point pairs:  (imgX, imgY) normalised 0-1  ↔  (uvU, uvV) 0-1
-    const controlPoints = this._buildControlPoints(landmarks, mapping, meshGen);
-    console.log(`PhotoUploader: ${controlPoints.length} control points mapped`);
+    // --- 1. Build correspondences: 3D FLAME position ↔ 2D image (normalised 0-1) ---
+    const posVerts = meshGen.flameTemplateVertices; // check existence
+    const posFaces = meshGen.flameFaces;
+    const uvCoords = meshGen.flameUVCoords;
+    const uvFaces  = meshGen.flameUVFaces;
+    const uvToPosMap = meshGen.uvToPosMap;
 
-    if (controlPoints.length < 10) {
-      console.warn('PhotoUploader: Too few control points — falling back to naive projection');
+    // We need the raw position vertices (5023×3). They're stored on the generator.
+    // Build correspondence from the 105 mapped landmarks.
+    const mpIndices   = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords  = mapping.lmk_b_coords;
+
+    // Gather (3D position, 2D image) pairs
+    const pairs = []; // { px, py, pz, ix, iy }
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (mpIdx >= landmarks.length) continue;
+      const lm = landmarks[mpIdx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const v0 = posFaces[fi * 3], v1 = posFaces[fi * 3 + 1], v2 = posFaces[fi * 3 + 2];
+
+      // Interpolate 3D position using barycentric coords
+      const px = bc[0] * posVerts[v0 * 3]     + bc[1] * posVerts[v1 * 3]     + bc[2] * posVerts[v2 * 3];
+      const py = bc[0] * posVerts[v0 * 3 + 1] + bc[1] * posVerts[v1 * 3 + 1] + bc[2] * posVerts[v2 * 3 + 1];
+      const pz = bc[0] * posVerts[v0 * 3 + 2] + bc[1] * posVerts[v1 * 3 + 2] + bc[2] * posVerts[v2 * 3 + 2];
+
+      pairs.push({ px, py, pz, ix: lm.x, iy: lm.y });
+    }
+    console.log(`PhotoUploader: ${pairs.length} landmark correspondences for camera solve`);
+
+    if (pairs.length < 6) {
+      console.warn('PhotoUploader: Too few correspondences — falling back');
       return this._naiveTextureProjection(img);
     }
 
-    // 3. Build arrays for Delaunay (UV space) and corresponding image-space coords
-    const allUV = [];
-    const allImg = [];
-    for (const cp of controlPoints) {
-      allUV.push({ x: cp.uvU, y: cp.uvV });
-      allImg.push({ x: cp.imgX, y: cp.imgY });
+    // --- 2. Solve affine camera: img_x = a*X + b*Y + c*Z + d, img_y = e*X + f*Y + g*Z + h ---
+    const proj = this._solveAffineCamera(pairs);
+    console.log(`PhotoUploader: Camera solved — residual ${proj.residual.toFixed(5)}`);
+
+    // --- 3. Project all 5023 position vertices to 2D image space ---
+    const nPos = posVerts.length / 3;
+    const projected = new Float32Array(nPos * 2);
+    for (let i = 0; i < nPos; i++) {
+      const X = posVerts[i * 3], Y = posVerts[i * 3 + 1], Z = posVerts[i * 3 + 2];
+      projected[i * 2]     = proj.a * X + proj.b * Y + proj.c * Z + proj.d; // img_x (0-1)
+      projected[i * 2 + 1] = proj.e * X + proj.f * Y + proj.g * Z + proj.h; // img_y (0-1)
     }
 
-    // 4. Add border/corner points
-    this._addBorderPoints(allUV, allImg);
+    // --- 4. Build per-UV-vertex image coordinates via uvToPosMap ---
+    const nUV = uvCoords.length / 2;
+    const uvImgCoords = new Float32Array(nUV * 2);
+    for (let i = 0; i < nUV; i++) {
+      const posIdx = uvToPosMap[i];
+      uvImgCoords[i * 2]     = projected[posIdx * 2];
+      uvImgCoords[i * 2 + 1] = projected[posIdx * 2 + 1];
+    }
 
-    // 5. Delaunay triangulate the UV-space points
-    const triangles = this._delaunayTriangulate(allUV);
-    console.log(`PhotoUploader: Delaunay produced ${triangles.length} triangles`);
-
-    // 6. Rasterise the warp
+    // --- 5. Rasterise all 9976 UV faces ---
     const outImageData = ctx.createImageData(size, size);
-    this._rasterizeWarp(outImageData, size, allUV, allImg, triangles, srcImageData);
+    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH);
 
-    // 7. Fill unmapped areas with skin colour
+    // --- 6. Fill unmapped areas ---
     this._fillUnmappedRegions(outImageData);
     ctx.putImageData(outImageData, 0, 0);
 
-    console.log('PhotoUploader: ✅ Piecewise affine warp complete');
+    console.log('PhotoUploader: ✅ Mesh-based texture projection complete');
 
     return {
       canvas,
@@ -254,283 +295,176 @@ export class PhotoUploader {
     };
   }
 
-  /**
-   * Build 105 control point pairs mapping image landmarks → FLAME UV coords.
-   */
-  _buildControlPoints(landmarks, mapping, meshGen) {
-    const uvCoords = meshGen.flameUVCoords;   // Float32Array  5118*2
-    const uvFaces = meshGen.flameUVFaces;     // Uint32Array   9976*3
-    const mpIndices = mapping.landmark_indices;
-    const faceIndices = mapping.lmk_face_idx;
-    const baryCoords = mapping.lmk_b_coords;
-
-    const points = [];
-    const EPS = 1e-4;
-
-    for (let i = 0; i < mpIndices.length; i++) {
-      const mpIdx = mpIndices[i];
-      if (mpIdx >= landmarks.length) continue;
-
-      // Image-space landmark (normalised 0–1)
-      const lm = landmarks[mpIdx];
-      const imgX = lm.x;
-      const imgY = lm.y;
-
-      // FLAME UV position via barycentric interpolation
-      const fIdx = faceIndices[i];
-      const uvi0 = uvFaces[fIdx * 3 + 0];
-      const uvi1 = uvFaces[fIdx * 3 + 1];
-      const uvi2 = uvFaces[fIdx * 3 + 2];
-
-      const u0 = uvCoords[uvi0 * 2],     v0 = uvCoords[uvi0 * 2 + 1];
-      const u1 = uvCoords[uvi1 * 2],     v1 = uvCoords[uvi1 * 2 + 1];
-      const u2 = uvCoords[uvi2 * 2],     v2 = uvCoords[uvi2 * 2 + 1];
-
-      const bc = baryCoords[i];
-      const uvU = u0 * bc[0] + u1 * bc[1] + u2 * bc[2];
-      const uvV = v0 * bc[0] + v1 * bc[1] + v2 * bc[2];
-
-      // Skip degenerate points
-      if (isNaN(uvU) || isNaN(uvV) || isNaN(imgX) || isNaN(imgY)) continue;
-      if (uvU < -EPS || uvU > 1 + EPS || uvV < -EPS || uvV > 1 + EPS) continue;
-
-      points.push({ imgX, imgY, uvU, uvV });
-    }
-
-    // Deduplicate: remove points too close in UV space (< 0.003)
-    const MIN_DIST_SQ = 0.003 * 0.003;
-    const deduped = [];
-    for (const p of points) {
-      let tooClose = false;
-      for (const q of deduped) {
-        const du = p.uvU - q.uvU;
-        const dv = p.uvV - q.uvV;
-        if (du * du + dv * dv < MIN_DIST_SQ) { tooClose = true; break; }
-      }
-      if (!tooClose) deduped.push(p);
-    }
-    return deduped;
-  }
-
-  /**
-   * Add border / corner points so the Delaunay triangulation covers the full
-   * UV [0,1]² square.  For each added UV point, we estimate an image-space
-   * position by extrapolating from the nearest existing control point.
-   */
-  _addBorderPoints(allUV, allImg) {
-    const borderUVs = [
-      { x: 0,    y: 0 },    { x: 0.5,  y: 0 },    { x: 1,    y: 0 },
-      { x: 0,    y: 0.25 }, { x: 1,    y: 0.25 },
-      { x: 0,    y: 0.5 },  { x: 1,    y: 0.5 },
-      { x: 0,    y: 0.75 }, { x: 1,    y: 0.75 },
-      { x: 0,    y: 1 },    { x: 0.5,  y: 1 },    { x: 1,    y: 1 },
-      { x: 0.25, y: 0 },    { x: 0.75, y: 0 },
-      { x: 0.25, y: 1 },    { x: 0.75, y: 1 },
-    ];
-
-    for (const bUV of borderUVs) {
-      // Find nearest existing control point
-      let bestDist = Infinity;
-      let bestIdx = 0;
-      for (let i = 0; i < allUV.length; i++) {
-        const dx = allUV[i].x - bUV.x;
-        const dy = allUV[i].y - bUV.y;
-        const d = dx * dx + dy * dy;
-        if (d < bestDist) { bestDist = d; bestIdx = i; }
-      }
-
-      // Extrapolate image position from nearest point
-      const nearUV = allUV[bestIdx];
-      const nearImg = allImg[bestIdx];
-      const offsetU = bUV.x - nearUV.x;
-      const offsetV = bUV.y - nearUV.y;
-
-      allUV.push(bUV);
-      allImg.push({
-        x: Math.max(0, Math.min(1, nearImg.x + offsetU * 0.5)),
-        y: Math.max(0, Math.min(1, nearImg.y + offsetV * 0.5)),
-      });
-    }
-  }
-
   // -----------------------------------------------------------------------
-  // Delaunay triangulation (Bowyer-Watson)
+  // Camera solver — affine 3D→2D projection
   // -----------------------------------------------------------------------
 
   /**
-   * Bowyer-Watson incremental Delaunay triangulation.
-   * @param {Array<{x:number, y:number}>} points
-   * @returns {Array<[number, number, number]>} Triangle index triples
+   * Solve an affine camera model from (3D, 2D) correspondences.
+   *   img_x = a*X + b*Y + c*Z + d
+   *   img_y = e*X + f*Y + g*Z + h
+   *
+   * Uses least-squares via normal equations.
+   * @returns {{ a,b,c,d,e,f,g,h, residual:number }}
    */
-  _delaunayTriangulate(points) {
-    const n = points.length;
-    if (n < 3) return [];
+  _solveAffineCamera(pairs) {
+    const n = pairs.length;
 
-    // Super-triangle that encloses the [0,1]² square with margin
-    const st0 = { x: -5, y: -5 };
-    const st1 = { x: 15, y: -5 };
-    const st2 = { x: 5,  y: 15 };
-    const allPts = [...points, st0, st1, st2];
-    const si0 = n, si1 = n + 1, si2 = n + 2;
-
-    let tris = [{ a: si0, b: si1, c: si2 }];
+    // Build A (n×4) and bx, by (n×1)
+    const A = new Float64Array(n * 4);
+    const bx = new Float64Array(n);
+    const by = new Float64Array(n);
 
     for (let i = 0; i < n; i++) {
-      const p = allPts[i];
-      const bad = [];
+      const p = pairs[i];
+      A[i * 4]     = p.px;
+      A[i * 4 + 1] = p.py;
+      A[i * 4 + 2] = p.pz;
+      A[i * 4 + 3] = 1.0;
+      bx[i] = p.ix;
+      by[i] = p.iy;
+    }
 
-      for (let t = 0; t < tris.length; t++) {
-        const tri = tris[t];
-        if (this._inCircumcircle(p, allPts[tri.a], allPts[tri.b], allPts[tri.c])) {
-          bad.push(t);
+    // Solve A * px = bx  and  A * py = by  via normal equations: (A^T A) x = A^T b
+    const px = this._leastSquares4(A, bx, n);
+    const py = this._leastSquares4(A, by, n);
+
+    // Compute residual
+    let res = 0;
+    for (let i = 0; i < n; i++) {
+      const p = pairs[i];
+      const ex = px[0]*p.px + px[1]*p.py + px[2]*p.pz + px[3] - p.ix;
+      const ey = py[0]*p.px + py[1]*p.py + py[2]*p.pz + py[3] - p.iy;
+      res += ex*ex + ey*ey;
+    }
+    res = Math.sqrt(res / n);
+
+    return { a: px[0], b: px[1], c: px[2], d: px[3],
+             e: py[0], f: py[1], g: py[2], h: py[3], residual: res };
+  }
+
+  /**
+   * Solve (A^T A) x = A^T b  for 4 unknowns via Gauss elimination.
+   * A is n×4 (flat), b is n×1.
+   */
+  _leastSquares4(A, b, n) {
+    // Build 4×4 normal matrix ATA and 4×1 ATb
+    const ATA = new Float64Array(16);
+    const ATb = new Float64Array(4);
+    for (let i = 0; i < n; i++) {
+      const a0 = A[i*4], a1 = A[i*4+1], a2 = A[i*4+2], a3 = A[i*4+3];
+      const bi = b[i];
+      ATA[0]  += a0*a0; ATA[1]  += a0*a1; ATA[2]  += a0*a2; ATA[3]  += a0*a3;
+      ATA[4]  += a1*a0; ATA[5]  += a1*a1; ATA[6]  += a1*a2; ATA[7]  += a1*a3;
+      ATA[8]  += a2*a0; ATA[9]  += a2*a1; ATA[10] += a2*a2; ATA[11] += a2*a3;
+      ATA[12] += a3*a0; ATA[13] += a3*a1; ATA[14] += a3*a2; ATA[15] += a3*a3;
+      ATb[0] += a0*bi; ATb[1] += a1*bi; ATb[2] += a2*bi; ATb[3] += a3*bi;
+    }
+
+    // Gauss elimination on [ATA | ATb]  (4×5 augmented)
+    const M = [
+      [ATA[0],  ATA[1],  ATA[2],  ATA[3],  ATb[0]],
+      [ATA[4],  ATA[5],  ATA[6],  ATA[7],  ATb[1]],
+      [ATA[8],  ATA[9],  ATA[10], ATA[11], ATb[2]],
+      [ATA[12], ATA[13], ATA[14], ATA[15], ATb[3]],
+    ];
+
+    // Forward elimination with partial pivoting
+    for (let col = 0; col < 4; col++) {
+      let maxRow = col, maxVal = Math.abs(M[col][col]);
+      for (let row = col + 1; row < 4; row++) {
+        if (Math.abs(M[row][col]) > maxVal) {
+          maxVal = Math.abs(M[row][col]);
+          maxRow = row;
         }
       }
+      if (maxRow !== col) { const tmp = M[col]; M[col] = M[maxRow]; M[maxRow] = tmp; }
+      if (Math.abs(M[col][col]) < 1e-15) continue;
 
-      // Build boundary polygon of the hole
-      const edges = [];
-      for (const ti of bad) {
-        const tri = tris[ti];
-        const te = [[tri.a, tri.b], [tri.b, tri.c], [tri.c, tri.a]];
-        for (const e of te) {
-          const shared = bad.some(oi =>
-            oi !== ti && this._triHasEdge(tris[oi], e[0], e[1])
-          );
-          if (!shared) edges.push(e);
-        }
-      }
-
-      // Remove bad triangles (reverse order to preserve indices)
-      bad.sort((a, b) => b - a);
-      for (const ti of bad) tris.splice(ti, 1);
-
-      // Create new triangles from boundary edges to inserted point
-      for (const [ea, eb] of edges) {
-        tris.push({ a: i, b: ea, c: eb });
+      for (let row = col + 1; row < 4; row++) {
+        const factor = M[row][col] / M[col][col];
+        for (let j = col; j < 5; j++) M[row][j] -= factor * M[col][j];
       }
     }
 
-    // Remove triangles referencing super-triangle vertices
-    tris = tris.filter(t => t.a < n && t.b < n && t.c < n);
-    return tris.map(t => [t.a, t.b, t.c]);
-  }
-
-  _inCircumcircle(p, a, b, c) {
-    // Ensure consistent winding (CCW)
-    const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    let A = a, B = b, C = c;
-    if (cross < 0) { B = c; C = b; } // swap to CCW
-
-    const ax = A.x - p.x, ay = A.y - p.y;
-    const bx = B.x - p.x, by = B.y - p.y;
-    const cx = C.x - p.x, cy = C.y - p.y;
-    const det = (ax * ax + ay * ay) * (bx * cy - cx * by)
-              - (bx * bx + by * by) * (ax * cy - cx * ay)
-              + (cx * cx + cy * cy) * (ax * by - bx * ay);
-    return det > 0;
-  }
-
-  _triHasEdge(tri, ea, eb) {
-    const v = [tri.a, tri.b, tri.c];
-    return v.includes(ea) && v.includes(eb);
+    // Back substitution
+    const x = [0, 0, 0, 0];
+    for (let i = 3; i >= 0; i--) {
+      let sum = M[i][4];
+      for (let j = i + 1; j < 4; j++) sum -= M[i][j] * x[j];
+      x[i] = Math.abs(M[i][i]) > 1e-15 ? sum / M[i][i] : 0;
+    }
+    return x;
   }
 
   // -----------------------------------------------------------------------
-  // Rasteriser
+  // Rasteriser — FLAME mesh faces
   // -----------------------------------------------------------------------
 
   /**
-   * Rasterise the piecewise affine warp from image to UV space.
+   * Rasterise all FLAME UV faces, sampling the source photo via projected
+   * per-vertex image coordinates.
    */
-  _rasterizeWarp(outImageData, size, uvPts, imgPts, triangles, srcImageData) {
+  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH) {
     const out = outImageData.data;
-    const srcW = srcImageData.width;
-    const srcH = srcImageData.height;
-    const src = srcImageData.data;
+    const nFaces = uvFaces.length / 3;
 
-    // Pre-compute per-triangle data
-    const triData = triangles.map(([i, j, k]) => {
-      const td = {
-        // UV-space triangle (0-1)
-        u0: uvPts[i].x, v0: uvPts[i].y,
-        u1: uvPts[j].x, v1: uvPts[j].y,
-        u2: uvPts[k].x, v2: uvPts[k].y,
-        // Image-space triangle (normalised 0-1)
-        ix0: imgPts[i].x, iy0: imgPts[i].y,
-        ix1: imgPts[j].x, iy1: imgPts[j].y,
-        ix2: imgPts[k].x, iy2: imgPts[k].y,
-      };
+    // Per-pixel Z-buffer (depth) not needed since faces don't overlap in UV space.
+    // We just rasterise every face and fill the output.
+
+    for (let f = 0; f < nFaces; f++) {
+      const vi0 = uvFaces[f * 3], vi1 = uvFaces[f * 3 + 1], vi2 = uvFaces[f * 3 + 2];
+
+      // UV-space triangle (0-1)
+      const u0 = uvCoords[vi0 * 2], v0 = uvCoords[vi0 * 2 + 1];
+      const u1 = uvCoords[vi1 * 2], v1 = uvCoords[vi1 * 2 + 1];
+      const u2 = uvCoords[vi2 * 2], v2 = uvCoords[vi2 * 2 + 1];
+
+      // Image-space coordinates (normalised 0-1) for each UV vertex
+      const ix0 = uvImgCoords[vi0 * 2], iy0 = uvImgCoords[vi0 * 2 + 1];
+      const ix1 = uvImgCoords[vi1 * 2], iy1 = uvImgCoords[vi1 * 2 + 1];
+      const ix2 = uvImgCoords[vi2 * 2], iy2 = uvImgCoords[vi2 * 2 + 1];
+
+      // Skip faces whose projected image coords are entirely outside [0,1]
+      const allIx = [ix0, ix1, ix2], allIy = [iy0, iy1, iy2];
+      if (Math.min(...allIx) > 1.1 || Math.max(...allIx) < -0.1 ||
+          Math.min(...allIy) > 1.1 || Math.max(...allIy) < -0.1) continue;
+
+      // Bounding box in pixel space
+      const minPx = Math.max(0, Math.floor(Math.min(u0, u1, u2) * size));
+      const maxPx = Math.min(size - 1, Math.ceil(Math.max(u0, u1, u2) * size));
+      const minPy = Math.max(0, Math.floor(Math.min(v0, v1, v2) * size));
+      const maxPy = Math.min(size - 1, Math.ceil(Math.max(v0, v1, v2) * size));
+
       // Barycentric denominator
-      td.denom = (td.v1 - td.v2) * (td.u0 - td.u2) + (td.u2 - td.u1) * (td.v0 - td.v2);
-      // Bounding box in UV space (as pixel coords)
-      td.minPx = Math.max(0, Math.floor(Math.min(td.u0, td.u1, td.u2) * size));
-      td.maxPx = Math.min(size - 1, Math.ceil(Math.max(td.u0, td.u1, td.u2) * size));
-      td.minPy = Math.max(0, Math.floor((1 - Math.max(td.v0, td.v1, td.v2)) * size));
-      td.maxPy = Math.min(size - 1, Math.ceil((1 - Math.min(td.v0, td.v1, td.v2)) * size));
-      return td;
-    });
+      const denom = (v1 - v2) * (u0 - u2) + (u2 - u1) * (v0 - v2);
+      if (Math.abs(denom) < 1e-12) continue;
+      const invDenom = 1.0 / denom;
 
-    // Build a spatial grid for accelerated triangle lookup (32×32 cells)
-    const GRID = 32;
-    const grid = new Array(GRID * GRID);
-    for (let c = 0; c < grid.length; c++) grid[c] = [];
-    for (let ti = 0; ti < triData.length; ti++) {
-      const td = triData[ti];
-      const minU = Math.min(td.u0, td.u1, td.u2);
-      const maxU = Math.max(td.u0, td.u1, td.u2);
-      const minV = Math.min(td.v0, td.v1, td.v2);
-      const maxV = Math.max(td.v0, td.v1, td.v2);
-      const gx0 = Math.max(0, Math.floor(minU * GRID));
-      const gx1 = Math.min(GRID - 1, Math.floor(maxU * GRID));
-      const gy0 = Math.max(0, Math.floor(minV * GRID));
-      const gy1 = Math.min(GRID - 1, Math.floor(maxV * GRID));
-      for (let gy = gy0; gy <= gy1; gy++) {
-        for (let gx = gx0; gx <= gx1; gx++) {
-          grid[gy * GRID + gx].push(ti);
-        }
-      }
-    }
+      for (let py = minPy; py <= maxPy; py++) {
+        const v = (py + 0.5) / size;
+        for (let px = minPx; px <= maxPx; px++) {
+          const u = (px + 0.5) / size;
 
-    for (let py = 0; py < size; py++) {
-      // No V-flip here: Three.js loadTexture sets flipY=true which handles
-      // the canvas top-to-bottom → OpenGL bottom-to-top conversion.
-      const v = (py + 0.5) / size;
-      const gy = Math.min(GRID - 1, Math.max(0, Math.floor(v * GRID)));
-
-      for (let px = 0; px < size; px++) {
-        const u = (px + 0.5) / size;
-        const outIdx = (py * size + px) * 4;
-        const gx = Math.min(GRID - 1, Math.max(0, Math.floor(u * GRID)));
-
-        // Check triangles in this grid cell
-        const candidates = grid[gy * GRID + gx];
-        let found = false;
-
-        for (const ti of candidates) {
-          const td = triData[ti];
-          if (Math.abs(td.denom) < 1e-12) continue;
-
-          const w0 = ((td.v1 - td.v2) * (u - td.u2) + (td.u2 - td.u1) * (v - td.v2)) / td.denom;
-          const w1 = ((td.v2 - td.v0) * (u - td.u2) + (td.u0 - td.u2) * (v - td.v2)) / td.denom;
+          const w0 = ((v1 - v2) * (u - u2) + (u2 - u1) * (v - v2)) * invDenom;
+          const w1 = ((v2 - v0) * (u - u2) + (u0 - u2) * (v - v2)) * invDenom;
           const w2 = 1.0 - w0 - w1;
 
-          if (w0 >= -0.001 && w1 >= -0.001 && w2 >= -0.001) {
-            // Map to image space (normalised 0-1)
-            const imgX = w0 * td.ix0 + w1 * td.ix1 + w2 * td.ix2;
-            const imgY = w0 * td.iy0 + w1 * td.iy1 + w2 * td.iy2;
+          if (w0 < -0.001 || w1 < -0.001 || w2 < -0.001) continue;
 
-            // Bilinear sample
-            const rgba = this._bilinearSample(src, srcW, srcH, imgX * srcW, imgY * srcH);
-            out[outIdx]     = rgba[0];
-            out[outIdx + 1] = rgba[1];
-            out[outIdx + 2] = rgba[2];
-            out[outIdx + 3] = 255;
-            found = true;
-            break;
-          }
-        }
+          // Map to image space
+          const imgX = w0 * ix0 + w1 * ix1 + w2 * ix2;
+          const imgY = w0 * iy0 + w1 * iy1 + w2 * iy2;
 
-        if (!found) {
-          out[outIdx + 3] = 0; // sentinel: unmapped
+          // Clamp to image bounds
+          if (imgX < 0 || imgX > 1 || imgY < 0 || imgY > 1) continue;
+
+          const outIdx = (py * size + px) * 4;
+          const rgba = this._bilinearSample(srcData, srcW, srcH, imgX * srcW, imgY * srcH);
+          out[outIdx]     = rgba[0];
+          out[outIdx + 1] = rgba[1];
+          out[outIdx + 2] = rgba[2];
+          out[outIdx + 3] = 255;
         }
       }
     }

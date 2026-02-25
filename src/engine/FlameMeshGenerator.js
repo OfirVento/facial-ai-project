@@ -1512,6 +1512,11 @@ export class FlameMeshGenerator {
     return this._flameTemplateMeta ?? null;
   }
 
+  /** @returns {Float32Array|null} Raw FLAME template vertex positions (5023×3 floats, metres). */
+  get flameTemplateVertices() {
+    return this._flameTemplateVertices ?? null;
+  }
+
   /** @returns {Float32Array|null} FLAME UV coordinates (5118×2 floats, u/v pairs in 0-1). */
   get flameUVCoords() {
     return this._flameUVCoords ?? null;
