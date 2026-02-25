@@ -1,0 +1,14 @@
+# Source FLAME model files (large, not needed for deployment)
+# Use /models/ to only match root-level models dir, not public/models/
+/models/
+/scripts/
+*.pkl
+*.npz
+*.npy
+*.pt
+*.pth
+*.onnx
+
+# Development files
+.claude/
+*.log
