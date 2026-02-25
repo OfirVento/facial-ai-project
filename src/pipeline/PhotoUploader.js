@@ -491,8 +491,9 @@ export class PhotoUploader {
     }
 
     for (let py = 0; py < size; py++) {
-      // Flip Y: canvas py=0 is top, UV v=0 is bottom
-      const v = 1.0 - (py + 0.5) / size;
+      // No V-flip here: Three.js loadTexture sets flipY=true which handles
+      // the canvas top-to-bottom → OpenGL bottom-to-top conversion.
+      const v = (py + 0.5) / size;
       const gy = Math.min(GRID - 1, Math.max(0, Math.floor(v * GRID)));
 
       for (let px = 0; px < size; px++) {
