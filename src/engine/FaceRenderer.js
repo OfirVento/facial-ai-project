@@ -387,6 +387,9 @@ export class FaceRenderer {
    * Useful as a quick demo / placeholder.
    */
   applyDemoTexture() {
+    // If we have a real albedo texture, don't overwrite it with the demo texture
+    if (this._hasRealAlbedo) return;
+
     const size = 512;
     const canvas = document.createElement('canvas');
     canvas.width = size;
@@ -429,6 +432,102 @@ export class FaceRenderer {
     this.faceMaterial.map = texture;
     this.faceMaterial.needsUpdate = true;
     return texture;
+  }
+
+  /**
+   * Apply a real FLAME albedo texture from raw Uint8Array RGB data.
+   *
+   * @param {Uint8Array} diffuseData - Raw RGB bytes (row-major, already vertically flipped).
+   *   Expected length: width * height * 3.
+   * @param {Uint8Array|null} [specularData=null] - Raw RGB bytes for specular map, or null.
+   * @param {Object|null} [meta=null] - Optional metadata object.
+   * @param {number[]} [meta.albedo_resolution] - [width, height], defaults to [512, 512].
+   * @param {number} [meta.specular_scale_factor] - Scale factor for specular, defaults to 0.26.
+   */
+  applyAlbedoTexture(diffuseData, specularData = null, meta = null) {
+    if (!this.faceMesh || !diffuseData) return;
+
+    const width = meta?.albedo_resolution?.[0] ?? 512;
+    const height = meta?.albedo_resolution?.[1] ?? 512;
+
+    // Three.js >= r152 removed THREE.RGBFormat; convert RGB → RGBA
+    const rgbaData = this._rgbToRgba(diffuseData, width, height);
+
+    // Create diffuse texture from raw RGBA uint8 data
+    const diffuseTex = new THREE.DataTexture(
+      rgbaData,
+      width,
+      height,
+      THREE.RGBAFormat,
+    );
+    diffuseTex.needsUpdate = true;
+    diffuseTex.colorSpace = THREE.SRGBColorSpace;
+    diffuseTex.wrapS = THREE.ClampToEdgeWrapping;
+    diffuseTex.wrapT = THREE.ClampToEdgeWrapping;
+    diffuseTex.minFilter = THREE.LinearMipmapLinearFilter;
+    diffuseTex.magFilter = THREE.LinearFilter;
+    diffuseTex.generateMipmaps = true;
+
+    // Apply to material
+    const material = this.faceMaterial;
+    if (material.map) material.map.dispose();
+    material.map = diffuseTex;
+    material.needsUpdate = true;
+
+    // Apply specular texture if available
+    if (specularData) {
+      const specRgba = this._rgbToRgba(specularData, width, height);
+      const specTex = new THREE.DataTexture(
+        specRgba,
+        width,
+        height,
+        THREE.RGBAFormat,
+      );
+      specTex.needsUpdate = true;
+      specTex.wrapS = THREE.ClampToEdgeWrapping;
+      specTex.wrapT = THREE.ClampToEdgeWrapping;
+      specTex.minFilter = THREE.LinearMipmapLinearFilter;
+      specTex.magFilter = THREE.LinearFilter;
+      specTex.generateMipmaps = true;
+
+      // Use specular map for roughness/metalness
+      if (material.roughnessMap) material.roughnessMap.dispose();
+      material.roughnessMap = specTex;
+      material.roughness = 0.7;
+      material.needsUpdate = true;
+    }
+
+    // Adjust material for realistic skin rendering with real texture
+    material.color.set(0xffffff); // Don't tint the texture
+    if (material.isMeshPhysicalMaterial) {
+      material.clearcoat = 0.05;
+      material.clearcoatRoughness = 0.4;
+      material.sheen = 0.3;
+      material.sheenColor.set(0xcc8866);
+      material.sheenRoughness = 0.6;
+    }
+
+    this._hasRealAlbedo = true;
+    console.log('FaceRenderer: Applied FLAME albedo texture (%dx%d)', width, height);
+  }
+
+  /**
+   * Convert a raw RGB Uint8Array to RGBA (opaque alpha = 255).
+   * @param {Uint8Array} rgb - Input RGB data.
+   * @param {number} width
+   * @param {number} height
+   * @returns {Uint8Array} RGBA data.
+   */
+  _rgbToRgba(rgb, width, height) {
+    const pixelCount = width * height;
+    const rgba = new Uint8Array(pixelCount * 4);
+    for (let i = 0; i < pixelCount; i++) {
+      rgba[i * 4]     = rgb[i * 3];
+      rgba[i * 4 + 1] = rgb[i * 3 + 1];
+      rgba[i * 4 + 2] = rgb[i * 3 + 2];
+      rgba[i * 4 + 3] = 255;
+    }
+    return rgba;
   }
 
   // -----------------------------------------------------------------------

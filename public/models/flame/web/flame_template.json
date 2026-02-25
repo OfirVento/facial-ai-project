@@ -1,0 +1,103 @@
+{
+  "vertex_count": 5023,
+  "face_count": 9976,
+  "shape_param_count": 50,
+  "expression_param_count": 50,
+  "total_shape_components": 300,
+  "total_expression_components": 100,
+  "has_uv": true,
+  "coordinate_system": "FLAME: X=right, Y=up, Z=toward-viewer",
+  "binary_files": {
+    "vertices": "flame_template_vertices.bin",
+    "shape_basis": "flame_shape_basis.bin",
+    "expression_basis": "flame_expression_basis.bin",
+    "faces": "flame_faces.bin",
+    "uv": "flame_uv.bin",
+    "uv_faces": "flame_uv_faces.bin",
+    "albedo_diffuse": "flame_albedo_diffuse.bin",
+    "albedo_specular": "flame_albedo_specular.bin"
+  },
+  "data_types": {
+    "vertices": "Float32Array",
+    "shape_basis": "Float32Array",
+    "expression_basis": "Float32Array",
+    "faces": "Uint32Array",
+    "uv": "Float32Array",
+    "uv_faces": "Uint32Array",
+    "albedo_diffuse": "Uint8Array",
+    "albedo_specular": "Uint8Array"
+  },
+  "vertex_positions_sample": {
+    "first_3": [
+      [
+        0.0596970349815886,
+        -0.010195394792214634,
+        -0.04816816201998935
+      ],
+      [
+        0.06362421094160983,
+        -0.011200203840084156,
+        -0.047268455549710715
+      ],
+      [
+        0.06433194555497103,
+        -0.009672870068385086,
+        -0.0471620215675961
+      ]
+    ],
+    "last_3": [
+      [
+        -0.03841468911099423,
+        0.021479960810099948,
+        0.011608793792740657
+      ],
+      [
+        -0.036233783008942685,
+        0.021913305891635964,
+        0.010445974487112045
+      ],
+      [
+        -0.033865794844818504,
+        0.02238693161493949,
+        0.009724263019463476
+      ]
+    ]
+  },
+  "face_indices_sample": {
+    "first_3": [
+      [
+        3,
+        1,
+        0
+      ],
+      [
+        7,
+        5,
+        4
+      ],
+      [
+        12,
+        14,
+        13
+      ]
+    ]
+  },
+  "uv_vertex_count": 5118,
+  "has_albedo": true,
+  "albedo_resolution": [
+    512,
+    512
+  ],
+  "specular_scale_factor": 0.25911899006177785,
+  "albedo_pca": {
+    "diffuse_components": 20,
+    "specular_components": 10,
+    "resolution": [
+      256,
+      256
+    ],
+    "diffuse_file": "flame_albedo_diffuse_pca.bin",
+    "specular_file": "flame_albedo_specular_pca.bin",
+    "dtype": "Float16Array"
+  }
+}

@@ -12,6 +12,7 @@ import { ComparisonAgent } from './agents/ComparisonAgent.js';
 import { VoiceAgent } from './agents/VoiceAgent.js';
 import { ConversationDirector } from './agents/ConversationDirector.js';
 import { PhotoUploader } from './pipeline/PhotoUploader.js';
+import { MediaPipeBridge } from './engine/MediaPipeBridge.js';
 
 class FacialAIProject {
   constructor() {
@@ -29,8 +30,10 @@ class FacialAIProject {
 
     // Pipeline
     this.photoUploader = new PhotoUploader();
+    this.mediaPipeBridge = null; // initialized lazily when webcam needed
 
     // State
+    this.flameLoaded = false; // true when real FLAME 2023 data is loaded
     this.morphState = {}; // regionName → { inflate, translateX, translateY, translateZ }
     this.morphHistory = [];
     this.morphHistoryIndex = -1;
@@ -44,7 +47,7 @@ class FacialAIProject {
     this.director = null;
   }
 
-  init() {
+  async init() {
     // Init 3D viewport
     const viewport = document.getElementById('face-viewport');
     if (viewport) {
@@ -52,8 +55,8 @@ class FacialAIProject {
       this.renderer.init();
     }
 
-    // Generate demo face mesh
-    this._generateDemoFace();
+    // Generate demo face mesh (tries real FLAME first, falls back to analytic)
+    await this._generateDemoFace();
 
     // Init director — pass morphEngine (this) and agent instances
     this.director = new ConversationDirector(this, {
@@ -83,10 +86,16 @@ class FacialAIProject {
     this._setupTopBarUI();
     this._setupViewportUI();
 
-    // Welcome message
+    // Welcome message — mention FLAME status
+    const flameStatus = this.flameLoaded
+      ? `Using **FLAME 2023** model (${this.meshGenerator.vertexCount.toLocaleString()} vertices, ${Object.keys(this.meshData.regions).length} clinical regions)`
+      : 'Using demo mesh (upload FLAME data or run Colab notebook for photorealistic reconstruction)';
+
     this._addMessage('assistant', `Welcome to your facial design consultation!
 
-Upload your photos on the left panel, or start exploring with the demo face.
+${flameStatus}
+
+Upload your photos on the left panel, or start exploring with the current face model.
 
 Try typing commands like:
 • "Make my nose thinner"
@@ -104,11 +113,47 @@ You can also click the quick-action buttons below, use the sliders on the left, 
   // MESH GENERATION
   // ============================================================
 
-  _generateDemoFace() {
-    this.meshData = this.meshGenerator.generate();
+  async _generateDemoFace() {
+    // Try loading real FLAME 2023 data first, fall back to analytic generation
+    try {
+      if (typeof this.meshGenerator.loadFLAME === 'function') {
+        this.meshData = await this.meshGenerator.loadFLAME('/models/flame/web');
+        // Check if real FLAME data was actually loaded (vs internal fallback to analytic)
+        this.flameLoaded = !!this.meshGenerator.isFlameLoaded;
+        if (this.flameLoaded) {
+          console.log('✅ Real FLAME 2023 mesh loaded: %d vertices, %d regions',
+            this.meshGenerator.vertexCount,
+            Object.keys(this.meshData.regions).length);
+        } else {
+          console.log('ℹ️ FLAME data not available, using analytic demo mesh (%d vertices)',
+            this.meshGenerator.vertexCount);
+        }
+      }
+    } catch (err) {
+      console.warn('FLAME load error, using analytic fallback:', err.message);
+    }
+
+    // Fallback to analytic mesh generation
+    if (!this.meshData) {
+      this.meshData = this.meshGenerator.generate();
+      this.flameLoaded = false;
+    }
+
     if (this.renderer) {
       this.renderer.loadFromGeometry(this.meshData.geometry);
-      this.renderer.applyDemoTexture();
+
+      // Apply real FLAME albedo texture if available, otherwise fall back to demo
+      if (this.flameLoaded && this.meshGenerator.hasAlbedo) {
+        const meta = this.meshGenerator.flameMeta;
+        this.renderer.applyAlbedoTexture(
+          this.meshGenerator.albedoDiffuseData,
+          this.meshGenerator.albedoSpecularData,
+          meta
+        );
+        console.log('✅ Applied FLAME albedo texture (diffuse + specular)');
+      } else {
+        this.renderer.applyDemoTexture();
+      }
     }
     this._renderRegionControls();
     this._updatePhaseIndicator('exploration');
@@ -136,6 +181,46 @@ You can also click the quick-action buttons below, use the sliders on the left, 
     } catch (err) {
       this._addMessage('system', `Error loading reconstruction: ${err.message}`);
       console.error(err);
+    }
+  }
+
+  /**
+   * Load DECA reconstruction results — applies shape/expression params from face_params.json.
+   * Called when user uploads the Colab output ZIP.
+   */
+  async loadDECAReconstruction(paramsJson) {
+    if (!this.flameLoaded || !this.meshGenerator.applyShapeParams) {
+      this._addMessage('system', 'FLAME model not loaded. Please ensure web-ready FLAME files are in /models/flame/web/');
+      return;
+    }
+
+    try {
+      const params = typeof paramsJson === 'string' ? JSON.parse(paramsJson) : paramsJson;
+
+      // Apply shape parameters to morph the template into the patient's face
+      if (params.shape_params) {
+        this.meshGenerator.applyShapeParams(params.shape_params);
+        this._addMessage('system', `Applied ${params.shape_params.length} shape parameters from DECA reconstruction`);
+      }
+
+      // Apply expression parameters (usually neutral for clinic use)
+      if (params.expression_params) {
+        this.meshGenerator.applyExpressionParams(params.expression_params);
+      }
+
+      // Update renderer with the new geometry
+      if (this.renderer && this.meshGenerator.geometry) {
+        this.renderer.loadFromGeometry(this.meshGenerator.geometry);
+      }
+
+      this._renderRegionControls();
+      this._updatePhaseIndicator('exploration');
+      this._addMessage('assistant', `DECA reconstruction loaded successfully.
+The 3D model now matches your photo with ${params.vertex_count?.toLocaleString() || '5,023'} vertices.
+You can now modify specific regions — try saying "make my nose thinner" or use the sliders.`);
+    } catch (err) {
+      console.error('Failed to load DECA reconstruction:', err);
+      this._addMessage('system', `Error loading reconstruction: ${err.message}`);
     }
   }
 

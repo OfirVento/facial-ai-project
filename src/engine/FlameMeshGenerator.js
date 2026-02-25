@@ -8,6 +8,12 @@
  * The mesh is built by creating a UV-sphere base and then applying a series of
  * analytic deformation fields that carve out eye sockets, raise the nose bridge,
  * shape lips with a cupid's bow, define the chin/jaw, etc.
+ *
+ * Additionally supports loading real FLAME model data from pre-converted web
+ * files (binary PCA bases, face indices, region maps). When loaded, shape and
+ * expression parameters can be applied via PCA deformation, and DECA
+ * reconstruction outputs can drive the mesh directly.  The analytic UV-sphere
+ * approach is kept as the default fallback when FLAME data is not available.
  */
 
 import * as THREE from 'three';
@@ -22,6 +28,39 @@ const DEFAULT_RINGS = 52;
 const DEFAULT_SEGMENTS = 52;
 /** Base head radius before deformation (in scene units, ~8.5 cm). */
 const BASE_RADIUS = 0.085;
+
+/** FLAME model constants */
+const FLAME_VERTEX_COUNT = 5023;
+const FLAME_FACE_COUNT = 9976;
+const FLAME_SHAPE_COMPONENTS = 50;
+const FLAME_EXPRESSION_COMPONENTS = 50;
+
+/**
+ * Descriptive names for the first 20 FLAME shape PCA components.
+ * Beyond these, names fall back to a generic "Shape Component N".
+ */
+const SHAPE_PARAM_NAMES = [
+  'Overall Head Size',
+  'Head Width',
+  'Head Height',
+  'Jaw Width',
+  'Jaw Length',
+  'Forehead Height',
+  'Brow Ridge Depth',
+  'Nose Length',
+  'Nose Width',
+  'Nose Bridge Height',
+  'Cheekbone Prominence',
+  'Chin Protrusion',
+  'Eye Socket Depth',
+  'Upper Face Width',
+  'Mid-Face Length',
+  'Lower Face Width',
+  'Lip Thickness',
+  'Philtrum Length',
+  'Ear Size',
+  'Face Taper',
+];
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -846,6 +885,70 @@ function remapUVs(positions, uvs, radius) {
 }
 
 // ---------------------------------------------------------------------------
+// FLAME data helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate simple spherical UVs for FLAME topology vertices.
+ * Projects vertex positions onto a UV sphere for texture mapping when
+ * the FLAME model does not include its own UV coordinates.
+ *
+ * @param {Float32Array} positions - Vertex positions (vertexCount * 3).
+ * @returns {Float32Array} UV coordinates (vertexCount * 2).
+ */
+function generateFlameUVs(positions) {
+  const vertCount = positions.length / 3;
+  const uvs = new Float32Array(vertCount * 2);
+
+  for (let i = 0; i < vertCount; i++) {
+    const x = positions[i * 3];
+    const y = positions[i * 3 + 1];
+    const z = positions[i * 3 + 2];
+    const len = Math.sqrt(x * x + y * y + z * z) || 1;
+
+    // Spherical projection
+    const nx = x / len;
+    const ny = y / len;
+    const nz = z / len;
+
+    // u from atan2(x, z), v from asin(y)
+    const u = 0.5 + Math.atan2(nx, nz) / (2 * Math.PI);
+    const v = 0.5 + Math.asin(clamp(ny, -1, 1)) / Math.PI;
+
+    uvs[i * 2]     = u;
+    uvs[i * 2 + 1] = v;
+  }
+
+  return uvs;
+}
+
+/**
+ * Fetch a binary file and return it as an ArrayBuffer.
+ * @param {string} url
+ * @returns {Promise<ArrayBuffer>}
+ */
+async function fetchBinary(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+  }
+  return response.arrayBuffer();
+}
+
+/**
+ * Fetch a JSON file and return the parsed object.
+ * @param {string} url
+ * @returns {Promise<any>}
+ */
+async function fetchJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+  }
+  return response.json();
+}
+
+// ---------------------------------------------------------------------------
 // FlameMeshGenerator class
 // ---------------------------------------------------------------------------
 
@@ -867,10 +970,36 @@ export class FlameMeshGenerator {
     this._regions = null;
     /** @private @type {Record<string, {label:string, parent:string|null, clinical:string}> | null} */
     this._regionMeta = null;
+
+    // ----- FLAME model data (populated by loadFLAME) -----
+
+    /** @private Whether real FLAME data has been loaded. */
+    this._flameLoaded = false;
+    /** @private FLAME template metadata from JSON. */
+    this._flameMeta = null;
+    /** @private Float32Array — original template vertex positions (vertexCount * 3). */
+    this._flameTemplateVertices = null;
+    /** @private Float32Array — shape PCA basis (vertexCount * 3 * shapeComponents). */
+    this._flameShapeBasis = null;
+    /** @private Float32Array — expression PCA basis (vertexCount * 3 * expressionComponents). */
+    this._flameExpressionBasis = null;
+    /** @private Uint32Array — face indices (faceCount * 3). */
+    this._flameFaces = null;
+    /** @private Region vertex index map from flame_regions.json. */
+    this._flameRegions = null;
+
+    /** @private Float32Array — current shaped vertex positions (after shape params applied). */
+    this._flameShapedVertices = null;
+    /** @private Float32Array — current final vertex positions (after shape + expression). */
+    this._flameCurrentVertices = null;
+    /** @private Current shape parameters. */
+    this._currentShapeParams = null;
+    /** @private Current expression parameters. */
+    this._currentExpressionParams = null;
   }
 
   // -----------------------------------------------------------------------
-  // Public API
+  // Public API — Analytic generation (original)
   // -----------------------------------------------------------------------
 
   /**
@@ -923,6 +1052,384 @@ export class FlameMeshGenerator {
     return { geometry, regions, regionMeta };
   }
 
+  // -----------------------------------------------------------------------
+  // Public API — FLAME model loading
+  // -----------------------------------------------------------------------
+
+  /**
+   * Load pre-converted FLAME model data from binary/JSON web files.
+   *
+   * Fetches the template mesh, PCA shape/expression bases, face indices,
+   * and region vertex map.  Constructs a Three.js BufferGeometry from the
+   * real FLAME topology and returns the same { geometry, regions, regionMeta }
+   * shape as `generate()`.
+   *
+   * If any fetch fails, falls back to the analytic `generate()` method and
+   * logs a warning to the console.
+   *
+   * @param {string} [basePath='/models/flame/web'] - URL path to the directory
+   *   containing the pre-converted FLAME web files.
+   * @returns {Promise<{
+   *   geometry: THREE.BufferGeometry,
+   *   regions: Record<string, number[]>,
+   *   regionMeta: Record<string, {label: string, parent: string|null, clinical: string}>
+   * }>}
+   */
+  async loadFLAME(basePath = '/models/flame/web') {
+    // Normalise path: strip trailing slash
+    const base = basePath.replace(/\/+$/, '');
+
+    try {
+      // Fetch all files in parallel
+      const [
+        templateMeta,
+        verticesBuf,
+        shapeBasisBuf,
+        expressionBasisBuf,
+        facesBuf,
+        regionsData,
+      ] = await Promise.all([
+        fetchJSON(`${base}/flame_template.json`),
+        fetchBinary(`${base}/flame_template_vertices.bin`),
+        fetchBinary(`${base}/flame_shape_basis.bin`),
+        fetchBinary(`${base}/flame_expression_basis.bin`),
+        fetchBinary(`${base}/flame_faces.bin`),
+        fetchJSON(`${base}/flame_regions.json`),
+      ]);
+
+      // Validate template metadata (support both snake_case and camelCase field names)
+      const vertexCount = templateMeta.vertex_count ?? templateMeta.vertexCount ?? FLAME_VERTEX_COUNT;
+      const faceCount = templateMeta.face_count ?? templateMeta.faceCount ?? FLAME_FACE_COUNT;
+      const shapeComponents = templateMeta.shape_param_count ?? templateMeta.shapeComponents ?? FLAME_SHAPE_COMPONENTS;
+      const expressionComponents = templateMeta.expression_param_count ?? templateMeta.expressionComponents ?? FLAME_EXPRESSION_COMPONENTS;
+
+      // Wrap ArrayBuffers into typed arrays
+      const templateVertices = new Float32Array(verticesBuf);
+      const shapeBasis = new Float32Array(shapeBasisBuf);
+      const expressionBasis = new Float32Array(expressionBasisBuf);
+      const faces = new Uint32Array(facesBuf);
+
+      // Validate sizes
+      const expectedVertSize = vertexCount * 3;
+      if (templateVertices.length !== expectedVertSize) {
+        throw new Error(
+          `FLAME vertex data size mismatch: expected ${expectedVertSize} floats, got ${templateVertices.length}`
+        );
+      }
+      const expectedShapeSize = vertexCount * 3 * shapeComponents;
+      if (shapeBasis.length !== expectedShapeSize) {
+        throw new Error(
+          `FLAME shape basis size mismatch: expected ${expectedShapeSize} floats, got ${shapeBasis.length}`
+        );
+      }
+      const expectedExprSize = vertexCount * 3 * expressionComponents;
+      if (expressionBasis.length !== expectedExprSize) {
+        throw new Error(
+          `FLAME expression basis size mismatch: expected ${expectedExprSize} floats, got ${expressionBasis.length}`
+        );
+      }
+      const expectedFaceSize = faceCount * 3;
+      if (faces.length !== expectedFaceSize) {
+        throw new Error(
+          `FLAME face index size mismatch: expected ${expectedFaceSize} uints, got ${faces.length}`
+        );
+      }
+
+      // After the main Promise.all, try loading texture data (non-critical, can fail gracefully)
+      let uvCoordsBuf = null;
+      let uvFacesBuf = null;
+      let albedoDiffuseBuf = null;
+      let albedoSpecularBuf = null;
+
+      try {
+        [uvCoordsBuf, uvFacesBuf] = await Promise.all([
+          fetchBinary(`${base}/flame_uv.bin`),
+          fetchBinary(`${base}/flame_uv_faces.bin`),
+        ]);
+        console.log('FlameMeshGenerator: UV mapping loaded');
+      } catch (e) {
+        console.warn('FlameMeshGenerator: UV mapping not available, using spherical UVs');
+      }
+
+      try {
+        [albedoDiffuseBuf, albedoSpecularBuf] = await Promise.all([
+          fetchBinary(`${base}/flame_albedo_diffuse.bin`),
+          fetchBinary(`${base}/flame_albedo_specular.bin`),
+        ]);
+        console.log('FlameMeshGenerator: Albedo textures loaded');
+      } catch (e) {
+        console.warn('FlameMeshGenerator: Albedo textures not available');
+      }
+
+      // Store FLAME data internally
+      this._flameMeta = {
+        vertexCount,
+        faceCount,
+        shapeComponents,
+        expressionComponents,
+        metadata: templateMeta.metadata ?? {},
+      };
+      this._flameTemplateVertices = templateVertices;
+      this._flameShapeBasis = shapeBasis;
+      this._flameExpressionBasis = expressionBasis;
+      this._flameFaces = faces;
+      this._flameRegions = regionsData;
+
+      // Store UV mapping data if available
+      if (uvCoordsBuf && uvFacesBuf) {
+        this._flameUVCoords = new Float32Array(uvCoordsBuf);
+        this._flameUVFaces = new Uint32Array(uvFacesBuf);
+        // Build position-to-UV vertex mapping
+        const uvVertexCount = this._flameUVCoords.length / 2;
+        this._flameUVVertexCount = uvVertexCount;
+        // Map: for each UV vertex, which position vertex it corresponds to
+        this._uvToPosMap = new Uint32Array(uvVertexCount);
+        for (let f = 0; f < faceCount; f++) {
+          for (let c = 0; c < 3; c++) {
+            const posIdx = faces[f * 3 + c];
+            const uvIdx = this._flameUVFaces[f * 3 + c];
+            this._uvToPosMap[uvIdx] = posIdx;
+          }
+        }
+      }
+
+      // Store albedo texture data
+      if (albedoDiffuseBuf) {
+        this._flameAlbedoDiffuse = new Uint8Array(albedoDiffuseBuf);
+      }
+      if (albedoSpecularBuf) {
+        this._flameAlbedoSpecular = new Uint8Array(albedoSpecularBuf);
+      }
+      this._flameTemplateMeta = templateMeta;
+
+      // Create working copies of vertex data
+      this._flameShapedVertices = new Float32Array(templateVertices);
+      this._flameCurrentVertices = new Float32Array(templateVertices);
+
+      // Reset current parameters
+      this._currentShapeParams = new Float32Array(shapeComponents);
+      this._currentExpressionParams = new Float32Array(expressionComponents);
+
+      // Build the Three.js geometry from FLAME data
+      const result = this._buildFlameGeometry();
+
+      this._flameLoaded = true;
+
+      return result;
+
+    } catch (err) {
+      console.warn(
+        'FlameMeshGenerator: Failed to load FLAME model data, falling back to analytic generation.',
+        err
+      );
+      return this.generate();
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Public API — FLAME parameter application
+  // -----------------------------------------------------------------------
+
+  /**
+   * Apply FLAME shape parameters via PCA deformation.
+   *
+   * Computes: v_shaped = v_template + shapedirs * params
+   *
+   * Updates the Three.js geometry positions in-place and stores the current
+   * shape parameters for later use (e.g. when expression params are applied
+   * on top).
+   *
+   * @param {number[]} params - Array of floats (up to 50 values, matching
+   *   the first N shape PCA components).  Values beyond the number of
+   *   available components are ignored.
+   */
+  applyShapeParams(params) {
+    if (!this._flameLoaded) {
+      throw new Error('FlameMeshGenerator: call loadFLAME() before applying shape parameters.');
+    }
+
+    const { vertexCount, shapeComponents } = this._flameMeta;
+    const templateVerts = this._flameTemplateVertices;
+    const shapeBasis = this._flameShapeBasis;
+    const shapedVerts = this._flameShapedVertices;
+
+    // Determine number of components to apply
+    const numParams = Math.min(params.length, shapeComponents);
+
+    // Store current params (zero-padded)
+    this._currentShapeParams = new Float32Array(shapeComponents);
+    for (let p = 0; p < numParams; p++) {
+      this._currentShapeParams[p] = params[p];
+    }
+
+    // v_shaped = v_template + shapedirs * params
+    // shapeBasis is laid out as: [vertex0_x_comp0, vertex0_x_comp1, ..., vertex0_y_comp0, ...]
+    // Actually stored as row-major: basis[v*3*C + coord*C + comp]
+    // where v = vertex index, coord = 0/1/2 (x/y/z), comp = component index
+    // Equivalently: basis[(v*3 + coord) * C + comp]
+    const V3 = vertexCount * 3;
+
+    // Start from template
+    shapedVerts.set(templateVerts);
+
+    // Add shape deformation
+    for (let i = 0; i < V3; i++) {
+      let delta = 0;
+      const basisOffset = i * shapeComponents;
+      for (let p = 0; p < numParams; p++) {
+        delta += shapeBasis[basisOffset + p] * params[p];
+      }
+      shapedVerts[i] += delta;
+    }
+
+    // Also re-apply expression params if they exist
+    const currentVerts = this._flameCurrentVertices;
+    currentVerts.set(shapedVerts);
+
+    if (this._currentExpressionParams) {
+      const exprBasis = this._flameExpressionBasis;
+      const { expressionComponents } = this._flameMeta;
+      const numExpr = Math.min(this._currentExpressionParams.length, expressionComponents);
+      let hasNonZero = false;
+      for (let p = 0; p < numExpr; p++) {
+        if (this._currentExpressionParams[p] !== 0) { hasNonZero = true; break; }
+      }
+      if (hasNonZero) {
+        for (let i = 0; i < V3; i++) {
+          let delta = 0;
+          const basisOffset = i * expressionComponents;
+          for (let p = 0; p < numExpr; p++) {
+            delta += exprBasis[basisOffset + p] * this._currentExpressionParams[p];
+          }
+          currentVerts[i] += delta;
+        }
+      }
+    }
+
+    // Update Three.js geometry in-place
+    this._updateGeometryPositions(currentVerts);
+  }
+
+  /**
+   * Apply FLAME expression parameters via PCA deformation.
+   *
+   * Computes: v_expressed = v_shaped + exprdirs * params
+   *
+   * The deformation is applied on top of the current shaped vertices
+   * (after applyShapeParams), not on top of the raw template.  Updates
+   * geometry positions in-place.
+   *
+   * @param {number[]} params - Array of floats (up to 50 values, matching
+   *   the first N expression PCA components).
+   */
+  applyExpressionParams(params) {
+    if (!this._flameLoaded) {
+      throw new Error('FlameMeshGenerator: call loadFLAME() before applying expression parameters.');
+    }
+
+    const { vertexCount, expressionComponents } = this._flameMeta;
+    const shapedVerts = this._flameShapedVertices;
+    const exprBasis = this._flameExpressionBasis;
+    const currentVerts = this._flameCurrentVertices;
+
+    // Determine number of components to apply
+    const numParams = Math.min(params.length, expressionComponents);
+
+    // Store current params (zero-padded)
+    this._currentExpressionParams = new Float32Array(expressionComponents);
+    for (let p = 0; p < numParams; p++) {
+      this._currentExpressionParams[p] = params[p];
+    }
+
+    // v_expressed = v_shaped + exprdirs * params
+    const V3 = vertexCount * 3;
+
+    // Start from shaped vertices
+    currentVerts.set(shapedVerts);
+
+    // Add expression deformation
+    for (let i = 0; i < V3; i++) {
+      let delta = 0;
+      const basisOffset = i * expressionComponents;
+      for (let p = 0; p < numParams; p++) {
+        delta += exprBasis[basisOffset + p] * params[p];
+      }
+      currentVerts[i] += delta;
+    }
+
+    // Update Three.js geometry in-place
+    this._updateGeometryPositions(currentVerts);
+  }
+
+  /**
+   * Apply DECA reconstruction output to the FLAME mesh.
+   *
+   * DECA provides shape parameters (identity), expression parameters,
+   * and optionally pose parameters.  This method applies shape then
+   * expression in sequence.
+   *
+   * @param {object} decaParams
+   * @param {number[]} decaParams.shape_params - Shape PCA coefficients.
+   * @param {number[]} decaParams.expression_params - Expression PCA coefficients.
+   * @param {number[]} [decaParams.pose_params] - Pose parameters (currently unused;
+   *   reserved for future jaw rotation / global pose support).
+   * @returns {THREE.BufferGeometry} The updated geometry.
+   */
+  setFromDECA(decaParams) {
+    if (!this._flameLoaded) {
+      throw new Error('FlameMeshGenerator: call loadFLAME() before applying DECA parameters.');
+    }
+
+    const { shape_params, expression_params } = decaParams;
+
+    // Apply shape first, then expression
+    if (shape_params && shape_params.length > 0) {
+      this.applyShapeParams(shape_params);
+    }
+    if (expression_params && expression_params.length > 0) {
+      this.applyExpressionParams(expression_params);
+    }
+
+    // pose_params reserved for future use (jaw rotation, global pose)
+    // TODO: Implement pose parameter support when needed
+
+    return this._geometry;
+  }
+
+  /**
+   * Get the valid range and human-readable name for a shape parameter index.
+   *
+   * Useful for building UI sliders that let users explore shape space.
+   * The range is a reasonable default for FLAME PCA components; actual
+   * values can exceed these bounds but results may become unrealistic.
+   *
+   * @param {number} index - Shape parameter index (0-49).
+   * @returns {{ min: number, max: number, name: string }}
+   */
+  getShapeParamRange(index) {
+    const maxIndex = this._flameMeta
+      ? this._flameMeta.shapeComponents - 1
+      : FLAME_SHAPE_COMPONENTS - 1;
+
+    const clampedIndex = clamp(Math.floor(index), 0, maxIndex);
+
+    // PCA components have decreasing variance; earlier components need wider range.
+    // First few components (overall size, width, height) need ~[-3, 3].
+    // Later components have smaller effect and [-2, 2] is usually sufficient.
+    const min = clampedIndex < 10 ? -3.0 : -2.0;
+    const max = clampedIndex < 10 ?  3.0 :  2.0;
+
+    const name = clampedIndex < SHAPE_PARAM_NAMES.length
+      ? SHAPE_PARAM_NAMES[clampedIndex]
+      : `Shape Component ${clampedIndex}`;
+
+    return { min, max, name };
+  }
+
+  // -----------------------------------------------------------------------
+  // Public API — Region queries (original)
+  // -----------------------------------------------------------------------
+
   /**
    * Get the vertex indices for a named region.
    *
@@ -931,7 +1438,7 @@ export class FlameMeshGenerator {
    */
   getRegionVertices(regionName) {
     if (!this._regions) {
-      throw new Error('FlameMeshGenerator: call generate() before querying regions.');
+      throw new Error('FlameMeshGenerator: call generate() or loadFLAME() before querying regions.');
     }
     return this._regions[regionName] ?? [];
   }
@@ -944,7 +1451,7 @@ export class FlameMeshGenerator {
    */
   getRegionChildren(regionName) {
     if (!this._regionMeta) {
-      throw new Error('FlameMeshGenerator: call generate() before querying regions.');
+      throw new Error('FlameMeshGenerator: call generate() or loadFLAME() before querying regions.');
     }
     const children = [];
     for (const [name, meta] of Object.entries(this._regionMeta)) {
@@ -980,9 +1487,272 @@ export class FlameMeshGenerator {
     return this._geometry.getAttribute('position').count;
   }
 
+  /** @returns {boolean} True if real FLAME model data has been loaded via loadFLAME(). */
+  get isFlameLoaded() {
+    return this._flameLoaded;
+  }
+
+  /** @returns {Uint8Array|null} Raw diffuse albedo texture data (512x512 RGB uint8) */
+  get albedoDiffuseData() {
+    return this._flameAlbedoDiffuse ?? null;
+  }
+
+  /** @returns {Uint8Array|null} Raw specular albedo texture data (512x512 RGB uint8) */
+  get albedoSpecularData() {
+    return this._flameAlbedoSpecular ?? null;
+  }
+
+  /** @returns {boolean} Whether albedo textures are loaded */
+  get hasAlbedo() {
+    return !!this._flameAlbedoDiffuse;
+  }
+
+  /** @returns {object|null} Template metadata from flame_template.json */
+  get flameMeta() {
+    return this._flameTemplateMeta ?? null;
+  }
+
   /** @returns {string[]} All 52 region names. */
   static get regionNames() {
     return Object.keys(REGION_META_DEFS);
+  }
+
+  // -----------------------------------------------------------------------
+  // Private — FLAME geometry construction
+  // -----------------------------------------------------------------------
+
+  /**
+   * Build a Three.js BufferGeometry from loaded FLAME model data.
+   *
+   * Creates geometry with position, normal, UV, and index attributes.
+   * The face mesh is centred at origin, facing +Z, and scaled to match
+   * our scene conventions (~0.085 unit radius).
+   *
+   * @private
+   * @returns {{
+   *   geometry: THREE.BufferGeometry,
+   *   regions: Record<string, number[]>,
+   *   regionMeta: Record<string, {label: string, parent: string|null, clinical: string}>
+   * }}
+   */
+  _buildFlameGeometry() {
+    const { vertexCount, faceCount } = this._flameMeta;
+    const templateVerts = this._flameCurrentVertices;
+    const faces = this._flameFaces;
+
+    // -- Compute bounding box to determine scale --
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+
+    for (let i = 0; i < vertexCount; i++) {
+      const x = templateVerts[i * 3];
+      const y = templateVerts[i * 3 + 1];
+      const z = templateVerts[i * 3 + 2];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+
+    const extentX = maxX - minX;
+    const extentY = maxY - minY;
+    const extentZ = maxZ - minZ;
+    const maxExtent = Math.max(extentX, extentY, extentZ);
+
+    // FLAME uses metres; our scene expects ~0.085 radius (0.17 diameter).
+    // Scale the FLAME mesh so that its largest extent maps to ~0.17 units.
+    const targetDiameter = this._radius * 2;
+    const scaleFactor = maxExtent > 0 ? targetDiameter / maxExtent : 1;
+
+    // Centre of bounding box
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const cz = (minZ + maxZ) / 2;
+
+    // Create scaled positions array (centred at origin, facing +Z)
+    const positions = new Float32Array(vertexCount * 3);
+    for (let i = 0; i < vertexCount; i++) {
+      positions[i * 3]     = (templateVerts[i * 3]     - cx) * scaleFactor;
+      positions[i * 3 + 1] = (templateVerts[i * 3 + 1] - cy) * scaleFactor;
+      positions[i * 3 + 2] = (templateVerts[i * 3 + 2] - cz) * scaleFactor;
+    }
+
+    // -- Build Three.js geometry --
+    const geometry = new THREE.BufferGeometry();
+
+    if (this._flameUVCoords && this._flameUVFaces) {
+      // Use proper UV topology (5118 vertices to match UV mapping)
+      const uvVertexCount = this._flameUVVertexCount;
+      const uvCoords = this._flameUVCoords;
+      const uvFaces = this._flameUVFaces;
+
+      // Create UV-expanded position array
+      const uvPositions = new Float32Array(uvVertexCount * 3);
+      for (let i = 0; i < uvVertexCount; i++) {
+        const posIdx = this._uvToPosMap[i];
+        uvPositions[i * 3]     = positions[posIdx * 3];
+        uvPositions[i * 3 + 1] = positions[posIdx * 3 + 1];
+        uvPositions[i * 3 + 2] = positions[posIdx * 3 + 2];
+      }
+
+      // Compute normals for UV-expanded geometry
+      const uvNormals = computeNormals(uvPositions, uvFaces);
+
+      geometry.setAttribute('position', new THREE.BufferAttribute(uvPositions, 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(uvNormals, 3));
+      geometry.setAttribute('uv', new THREE.BufferAttribute(uvCoords, 2));
+      geometry.setIndex(new THREE.BufferAttribute(uvFaces, 1));
+    } else {
+      // Fallback: spherical UVs with original topology
+      const normals = computeNormals(positions, faces);
+      const uvs = generateFlameUVs(positions);
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+      geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geometry.setIndex(new THREE.BufferAttribute(faces, 1));
+    }
+
+    geometry.computeBoundingSphere();
+    geometry.computeBoundingBox();
+
+    // -- Build regions from flame_regions.json --
+    const regions = this._buildFlameRegions();
+
+    // -- Deep-copy region metadata --
+    const regionMeta = {};
+    for (const [name, def] of Object.entries(REGION_META_DEFS)) {
+      regionMeta[name] = { ...def };
+    }
+
+    // Cache results
+    this._geometry   = geometry;
+    this._regions    = regions;
+    this._regionMeta = regionMeta;
+
+    // Store scale and offset for later position updates
+    this._flameScale = scaleFactor;
+    this._flameCenterX = cx;
+    this._flameCenterY = cy;
+    this._flameCenterZ = cz;
+
+    return { geometry, regions, regionMeta };
+  }
+
+  /**
+   * Build region vertex index map from the loaded flame_regions.json data.
+   *
+   * The JSON file maps region names to arrays of vertex indices.  We use the
+   * same 52 clinical zone names as REGION_META_DEFS.  Any region in
+   * REGION_META_DEFS that is missing from the JSON will get an empty array.
+   * Any extra regions in the JSON that are not in REGION_META_DEFS are
+   * silently ignored.
+   *
+   * @private
+   * @returns {Record<string, number[]>}
+   */
+  _buildFlameRegions() {
+    const regions = {};
+
+    // Initialise all expected regions to empty arrays
+    for (const name of Object.keys(REGION_META_DEFS)) {
+      regions[name] = [];
+    }
+
+    // Overlay with data from flame_regions.json
+    if (this._flameRegions) {
+      const zonesData = this._flameRegions.zones ?? this._flameRegions;
+      for (const [name, data] of Object.entries(zonesData)) {
+        if (name in regions) {
+          // Handle both direct arrays and {vertex_indices: [...]} format
+          if (Array.isArray(data)) {
+            regions[name] = data.slice();
+          } else if (data && Array.isArray(data.vertex_indices)) {
+            regions[name] = data.vertex_indices.slice();
+          }
+        }
+      }
+    }
+
+    // If using UV topology, remap region indices to UV vertex space
+    if (this._uvToPosMap) {
+      // Build reverse map: position idx -> list of UV indices
+      const posToUvMap = {};
+      for (let uvIdx = 0; uvIdx < this._flameUVVertexCount; uvIdx++) {
+        const posIdx = this._uvToPosMap[uvIdx];
+        if (!posToUvMap[posIdx]) posToUvMap[posIdx] = [];
+        posToUvMap[posIdx].push(uvIdx);
+      }
+
+      // Remap each region
+      for (const name of Object.keys(regions)) {
+        const posIndices = regions[name];
+        const uvIndices = [];
+        for (const posIdx of posIndices) {
+          const mapped = posToUvMap[posIdx];
+          if (mapped) uvIndices.push(...mapped);
+        }
+        regions[name] = uvIndices;
+      }
+    }
+
+    return regions;
+  }
+
+  /**
+   * Update the Three.js geometry positions in-place from a flat vertex array.
+   *
+   * Applies the stored scale and centering transform so the mesh stays at
+   * the origin with the correct scene-space size.  Also recomputes normals.
+   *
+   * @private
+   * @param {Float32Array} vertices - Raw FLAME-space vertex positions (vertexCount * 3).
+   */
+  _updateGeometryPositions(vertices) {
+    if (!this._geometry) return;
+
+    const posAttr = this._geometry.getAttribute('position');
+    const positions = posAttr.array;
+    const vertexCount = this._flameMeta.vertexCount;
+
+    const s = this._flameScale;
+    const cx = this._flameCenterX;
+    const cy = this._flameCenterY;
+    const cz = this._flameCenterZ;
+
+    for (let i = 0; i < vertexCount; i++) {
+      positions[i * 3]     = (vertices[i * 3]     - cx) * s;
+      positions[i * 3 + 1] = (vertices[i * 3 + 1] - cy) * s;
+      positions[i * 3 + 2] = (vertices[i * 3 + 2] - cz) * s;
+    }
+
+    // If using UV topology, remap positions from PCA space (5023) to UV space (5118)
+    if (this._uvToPosMap && this._flameUVFaces) {
+      const uvVertexCount = this._flameUVVertexCount;
+      // The geometry was built with UV topology, so posAttr has uvVertexCount entries
+      // Map each UV vertex to its position vertex
+      for (let i = 0; i < uvVertexCount; i++) {
+        const posIdx = this._uvToPosMap[i];
+        positions[i * 3]     = (vertices[posIdx * 3]     - cx) * s;
+        positions[i * 3 + 1] = (vertices[posIdx * 3 + 1] - cy) * s;
+        positions[i * 3 + 2] = (vertices[posIdx * 3 + 2] - cz) * s;
+      }
+    }
+
+    posAttr.needsUpdate = true;
+
+    // Recompute normals (use UV faces if available, otherwise position faces)
+    const faces = this._flameUVFaces ?? this._flameFaces;
+    const newNormals = computeNormals(positions, faces);
+    const normalAttr = this._geometry.getAttribute('normal');
+    normalAttr.array.set(newNormals);
+    normalAttr.needsUpdate = true;
+
+    // Recompute bounds
+    this._geometry.computeBoundingSphere();
+    this._geometry.computeBoundingBox();
   }
 }
 

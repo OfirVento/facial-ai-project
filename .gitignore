@@ -5,3 +5,17 @@ dist/
 .env
 .claude/
 .vercel
+
+# FLAME model files (too large for git, kept locally)
+models/flame/flame2023/
+models/flame/vertex_masks/
+models/flame/mediapipe/
+models/flame/texture_space/
+models/flame/albedo/
+models/flame/web/
+*.pkl
+*.npz
+*.npy
+*.pt
+*.pth
+*.onnx
