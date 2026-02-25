@@ -424,9 +424,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
 
         // Apply photo texture to existing mesh
         if (this.renderer) {
-          await this.renderer.loadTextureFromDataUrl(texture.dataUrl, 'albedo');
+          await this.renderer.loadTexture(texture.dataUrl, 'albedo');
           if (normalMap) {
-            await this.renderer.loadTextureFromDataUrl(normalMap.dataUrl, 'normal');
+            await this.renderer.loadTexture(normalMap.dataUrl, 'normal');
           }
         }
 
