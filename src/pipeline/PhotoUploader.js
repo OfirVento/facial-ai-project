@@ -652,6 +652,11 @@ export class PhotoUploader {
     // Divides out low-frequency luminance so 3D lighting can create proper shadows.
     this._delightTexture(outImageData, size);
 
+    // --- 5c. Soften alpha boundaries for smooth blending transitions ---
+    // The alpha channel is the blend mask for Laplacian blending.
+    // Blurring it creates gradual photo-to-albedo transitions at all edges.
+    this._softenAlphaBoundary(outImageData, size, Math.max(6, Math.round(size / 128)));
+
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
     preFillCanvas.width = size;
@@ -1711,7 +1716,8 @@ export class PhotoUploader {
    * @param {Array} landmarks - MediaPipe 478 landmarks (normalised 0-1)
    * @param {number} srcW - source image width in pixels
    * @param {number} srcH - source image height in pixels
-   * @returns {Uint8Array} srcW*srcH binary mask (1 = inside face, 0 = outside)
+   * @returns {Uint8Array} srcW*srcH mask (1 = inside face, 0 = outside)
+   *          Also stores gradient version in this._faceBoundaryGradient for blending.
    */
   _buildFaceBoundaryMask(landmarks, srcW, srcH) {
     // MediaPipe standard face oval contour (ordered: forehead → jaw → forehead)
@@ -1740,13 +1746,19 @@ export class PhotoUploader {
       return mask;
     }
 
-    // Expand polygon outward by a small margin to avoid cutting face edges
+    // Compute face size for relative margin
     let cx = 0, cy = 0;
     for (let i = 0; i < polyX.length; i++) { cx += polyX[i]; cy += polyY[i]; }
     cx /= polyX.length;
     cy /= polyY.length;
+    let maxDist = 0;
+    for (let i = 0; i < polyX.length; i++) {
+      const d = Math.sqrt((polyX[i] - cx) ** 2 + (polyY[i] - cy) ** 2);
+      if (d > maxDist) maxDist = d;
+    }
 
-    const MARGIN_PX = 15;
+    // Face-relative margin: 5% of face radius
+    const MARGIN_PX = Math.max(10, Math.round(maxDist * 0.05));
     for (let i = 0; i < polyX.length; i++) {
       const dx = polyX[i] - cx;
       const dy = polyY[i] - cy;
@@ -1757,7 +1769,7 @@ export class PhotoUploader {
       }
     }
 
-    // Scanline polygon rasterisation
+    // Scanline polygon rasterisation (binary core mask)
     const mask = new Uint8Array(srcW * srcH);
     const nVerts = polyX.length;
 
@@ -1792,7 +1804,7 @@ export class PhotoUploader {
 
     let count = 0;
     for (let i = 0; i < mask.length; i++) if (mask[i]) count++;
-    console.log(`Face boundary mask: ${count}/${srcW * srcH} pixels inside face (${(count / (srcW * srcH) * 100).toFixed(1)}%)`);
+    console.log(`Face boundary mask: ${count}/${srcW * srcH} pixels inside face (${(count / (srcW * srcH) * 100).toFixed(1)}%), margin=${MARGIN_PX}px`);
 
     return mask;
   }
@@ -2076,6 +2088,54 @@ export class PhotoUploader {
   /**
    * Remove baked-in photo shading from the texture (Tier A delighting).
    *
+   * Soften alpha boundaries for smooth blending transitions.
+   * Applies a box blur to just the alpha channel, creating gradual
+   * photo-to-albedo transitions at face edges, visibility fades, etc.
+   * Only reduces alpha (never increases beyond original), preserving fully-mapped regions.
+   */
+  _softenAlphaBoundary(imageData, size, radius = 16) {
+    const data = imageData.data;
+    const N = size * size;
+
+    // Extract alpha channel
+    const alpha = new Float32Array(N);
+    for (let i = 0; i < N; i++) alpha[i] = data[i * 4 + 3];
+
+    // Two-pass box blur on alpha
+    const tmp = new Float32Array(N);
+    // Horizontal
+    for (let y = 0; y < size; y++) {
+      let sum = 0, count = 0;
+      for (let x = 0; x < Math.min(radius, size); x++) { sum += alpha[y * size + x]; count++; }
+      for (let x = 0; x < size; x++) {
+        if (x + radius < size) { sum += alpha[y * size + x + radius]; count++; }
+        if (x - radius - 1 >= 0) { sum -= alpha[y * size + x - radius - 1]; count--; }
+        tmp[y * size + x] = sum / count;
+      }
+    }
+    // Vertical
+    const blurred = new Float32Array(N);
+    for (let x = 0; x < size; x++) {
+      let sum = 0, count = 0;
+      for (let y = 0; y < Math.min(radius, size); y++) { sum += tmp[y * size + x]; count++; }
+      for (let y = 0; y < size; y++) {
+        if (y + radius < size) { sum += tmp[(y + radius) * size + x]; count++; }
+        if (y - radius - 1 >= 0) { sum -= tmp[(y - radius - 1) * size + x]; count--; }
+        blurred[y * size + x] = sum / count;
+      }
+    }
+
+    // Apply: use min(original, blurred) so we only soften edges, never inflate
+    let softened = 0;
+    for (let i = 0; i < N; i++) {
+      const newAlpha = Math.min(alpha[i], blurred[i]);
+      if (newAlpha < alpha[i]) softened++;
+      data[i * 4 + 3] = Math.round(newAlpha);
+    }
+    console.log(`PhotoUploader DENSE: Alpha softening: ${softened} pixels softened (radius=${radius})`);
+  }
+
+  /**
    * Computes a low-frequency luminance field (heavy box blur on the luminance channel),
    * then divides each pixel's RGB by this field to produce a flat-lit albedo.
    * This removes the photo's original shadows so 3D lighting creates consistent ones.
@@ -2164,7 +2224,7 @@ export class PhotoUploader {
     // This normalizes each pixel to remove directional lighting while preserving
     // the overall brightness level (avgLum).
     // Use a mild strength factor to avoid over-flattening.
-    const strength = 0.7; // 0=no delighting, 1=full delighting
+    const strength = 0.35; // 0=no delighting, 1=full delighting (keep mild to preserve natural look)
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] === 0) continue;
 
@@ -2533,8 +2593,10 @@ export class PhotoUploader {
       maskedPhoto[i * 3 + 1] = photoRGB[i * 3 + 1] * mask[i];
       maskedPhoto[i * 3 + 2] = photoRGB[i * 3 + 2] * mask[i];
     }
-    const blurredMasked = this._gaussBlur(maskedPhoto, size, size, ch, 8);
-    const blurredMask = this._gaussBlur(mask, size, size, 1, 8);
+    // Use larger blur radius for wider mask-normalized transition (relative to texture size)
+    const maskBlurR = Math.max(8, Math.round(size / 64));  // ~32px at 2048
+    const blurredMasked = this._gaussBlur(maskedPhoto, size, size, ch, maskBlurR);
+    const blurredMask = this._gaussBlur(mask, size, size, 1, maskBlurR);
     // Normalize: fill unmapped photo pixels with mask-normalized values
     const photoFilled = new Float32Array(photoRGB);
     for (let i = 0; i < N; i++) {
