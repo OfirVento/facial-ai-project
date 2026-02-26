@@ -185,43 +185,31 @@ export class PhotoUploader {
 
     console.log(`PhotoUploader: Detected ${landmarks.length} landmarks, projecting onto FLAME UV space…`);
 
-    // Store image dimensions for expression fitting lip gap detection
-    this._lastImgH = img.naturalHeight;
-
-    // Estimate focal length and camera distance from IPD
-    let perspParams = null;
-    try {
-      perspParams = this._estimateFocalLength(landmarks, img.naturalWidth, img.naturalHeight, meshGen);
-    } catch (err) {
-      console.warn('PhotoUploader: Focal length estimation failed:', err.message);
-    }
+    console.log(`PhotoUploader: Image ${img.naturalWidth}×${img.naturalHeight}`);
 
     // Fit FLAME shape to match user's face proportions before texture baking
     try {
-      this._fitShapeFromLandmarks(landmarks, mapping, meshGen, perspParams);
+      this._fitShapeFromLandmarks(landmarks, mapping, meshGen);
     } catch (err) {
       console.warn('PhotoUploader: Shape fitting failed, using mean shape:', err.message);
     }
 
     // Fit FLAME expression to match the photo's mouth/eyes/brows
     try {
-      this._fitExpressionFromLandmarks(landmarks, mapping, meshGen, perspParams);
+      this._fitExpressionFromLandmarks(landmarks, mapping, meshGen);
     } catch (err) {
       console.warn('PhotoUploader: Expression fitting failed, using neutral:', err.message);
     }
 
-    // Try Dense Projection first (camera-based), fall back to TPS
-    try {
-      const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen, perspParams);
-      if (result) {
-        console.log('PhotoUploader: Dense projection succeeded');
-        return result;
-      }
-    } catch (err) {
-      console.warn('PhotoUploader: Dense projection failed, falling back to TPS:', err.message);
+    // Dense Projection (camera-based texture baking)
+    const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen);
+    if (result) {
+      console.log('PhotoUploader: Dense projection succeeded');
+      return result;
     }
 
-    console.log('PhotoUploader: Using TPS fallback');
+    // If dense projection fails, it's a real problem — log it clearly
+    console.error('PhotoUploader: Dense projection returned null! Falling back to TPS.');
     return this._warpTextureToUV(img, landmarks, mapping, meshGen);
   }
 
@@ -547,7 +535,7 @@ export class PhotoUploader {
    * 4. Rasterises visible faces using the existing mesh rasteriser
    * 5. Fills non-visible regions from the FLAME albedo texture
    */
-  _denseProjectTextureToUV(img, landmarks, mapping, meshGen, perspParams = null) {
+  _denseProjectTextureToUV(img, landmarks, mapping, meshGen) {
     const size = 2048;
     const canvas = document.createElement('canvas');
     canvas.width = size;
@@ -566,17 +554,21 @@ export class PhotoUploader {
     const srcData = srcCanvas.getContext('2d').getImageData(0, 0, srcW, srcH).data;
 
     // --- 1. Estimate camera from 105 2D-3D correspondences ---
-    const cameraParams = this._estimateCameraFromLandmarks(landmarks, mapping, meshGen, perspParams);
+    const cameraParams = this._estimateCameraFromLandmarks(landmarks, mapping, meshGen);
     if (!cameraParams) {
-      console.warn('PhotoUploader: Camera estimation failed');
+      console.error('PhotoUploader: Camera estimation FAILED — cannot proceed');
       return null;
     }
+    console.log(`PhotoUploader DIAG: camera sx=${cameraParams.sx.toFixed(4)}, sy=${cameraParams.sy.toFixed(4)}, tx=${cameraParams.tx.toFixed(4)}, ty=${cameraParams.ty.toFixed(4)}`);
 
     // --- 2. Project all position vertices to image space ---
     const projectedCoords = this._projectAllVertices(meshGen, cameraParams);
 
     // --- 3. Compute per-face visibility (backface culling) ---
     const faceVisibility = this._computeFaceVisibility(meshGen, cameraParams);
+
+    // --- 3b. Build debug overlay: MediaPipe landmarks + projected FLAME outline ---
+    this._buildDebugOverlay(img, landmarks, projectedCoords, meshGen, srcW, srcH);
 
     // --- 4. Map position-vertex projections to UV-vertex coords ---
     const uvCoords = meshGen.flameUVCoords;
@@ -671,7 +663,7 @@ export class PhotoUploader {
    * @returns {{ R: Float64Array, fx: number, fy: number, cx: number, cy: number,
    *             tx: number, ty: number, tz: number }} | null
    */
-  _estimateCameraFromLandmarks(landmarks, mapping, meshGen, perspParams = null) {
+  _estimateCameraFromLandmarks(landmarks, mapping, meshGen) {
     const mpIndices = mapping.landmark_indices;
     const faceIndices = mapping.lmk_face_idx;
     const baryCoords = mapping.lmk_b_coords;
@@ -709,12 +701,10 @@ export class PhotoUploader {
     // --- Rotate all 3D points ---
     const xr = new Float64Array(N);
     const yr = new Float64Array(N);
-    const zr = new Float64Array(N);
     for (let i = 0; i < N; i++) {
       const [x, y, z] = pts3d[i];
       xr[i] = R[0] * x + R[1] * y + R[2] * z;
       yr[i] = R[3] * x + R[4] * y + R[5] * z;
-      zr[i] = R[6] * x + R[7] * y + R[8] * z;
     }
 
     // --- Weak-perspective least squares with separate X/Y scales ---
@@ -751,20 +741,7 @@ export class PhotoUploader {
 
     if (!isFinite(sx) || !isFinite(sy) || Math.abs(sx) < 1e-6) return null;
 
-    console.log(`PhotoUploader DENSE: Weak perspective: sx=${sx.toFixed(4)}, sy=${sy.toFixed(4)}, tx=${tx.toFixed(4)}, ty=${ty.toFixed(4)}`);
-
-    // --- Convert to perspective parameters ---
-    let meanZ = 0;
-    for (let i = 0; i < N; i++) meanZ += zr[i];
-    meanZ /= N;
-    // Use IPD-estimated Z_face if available; otherwise fall back to heuristic
-    const tz = (perspParams && perspParams.Z_face) ? perspParams.Z_face : Math.max(Math.abs(meanZ), 0.01);
-    // sx ≈ fx / tz  →  fx = sx * tz
-    const fx = sx * tz;
-    const fy = sy * tz;
-    if (perspParams && perspParams.Z_face) {
-      console.log(`PhotoUploader DENSE: Using perspective Z_face=${tz.toFixed(3)}m (IPD-estimated)`);
-    }
+    console.log(`PhotoUploader DENSE: Anisotropic weak-persp: sx=${sx.toFixed(4)}, sy=${sy.toFixed(4)}, tx=${tx.toFixed(4)}, ty=${ty.toFixed(4)}`);
 
     // --- Validate: reprojection error using weak perspective model ---
     let totalErr = 0;
@@ -783,7 +760,7 @@ export class PhotoUploader {
       return null;
     }
 
-    return { R, fx, fy, tx, ty, tz, meanZ, sx, sy };
+    return { R, sx, sy, tx, ty };
   }
 
   /**
@@ -979,71 +956,22 @@ export class PhotoUploader {
   }
 
   /**
-   * Estimate camera for shape/expression fitting.
+   * Estimate anisotropic weak-perspective camera for shape/expression fitting.
    *
-   * When perspective params (Z_face, fxNorm, fyNorm) are provided, uses a pinhole
-   * camera model. Otherwise falls back to isotropic weak-perspective.
+   * Solves for separate sx, sy, tx, ty (4 unknowns via two independent 2x2 systems):
+   *   imgX = sx * (R·p).x + tx
+   *   imgY = sy * (R·p).y + ty
    *
-   * Perspective model:  imgX = fxNorm * (R·p).x / ((R·p).z + Z_face) + cx
-   *                     imgY = fyNorm * (R·p).y / ((R·p).z + Z_face) + cy
-   *
-   * Weak-perspective:   imgX =  s * (R·p).x + tx
-   *                     imgY = -s * (R·p).y + ty
+   * Anisotropic scales let the camera absorb proportion differences without
+   * forcing shape/expression to distort the mesh.
    */
-  _estimateShapeFitCamera(lmk3D, pts2D, Z_face = null, fxNorm = null, fyNorm = null) {
+  _estimateShapeFitCamera(lmk3D, pts2D) {
     const N = lmk3D.length;
 
-    // Estimate rotation via Procrustes (reuse existing method)
-    let R = this._estimateRotationFromLandmarks(lmk3D, pts2D);
+    // Estimate rotation via Procrustes
+    const R = this._estimateRotationFromLandmarks(lmk3D, pts2D);
 
-    // --- Perspective mode ---
-    if (Z_face != null && fxNorm != null && fyNorm != null) {
-      // Iterative depth-corrected Procrustes (3 refinement iterations)
-      for (let pIter = 0; pIter < 3; pIter++) {
-        // For each point, compute per-vertex depth and undo perspective
-        const pts3dCorrected = [];
-        const pts2dCorrected = [];
-        for (let i = 0; i < N; i++) {
-          const [x, y, z] = lmk3D[i];
-          const zr = R[6] * x + R[7] * y + R[8] * z;
-          const Zk = zr + Z_face;
-          if (Zk < 0.01) continue;
-          // "Undo" perspective: scale 2D obs by Zk/fx to get 3D-like X
-          pts3dCorrected.push(lmk3D[i]);
-          pts2dCorrected.push(pts2D[i]);
-        }
-        if (pts3dCorrected.length >= 10) {
-          R = this._estimateRotationFromLandmarks(pts3dCorrected, pts2dCorrected);
-        }
-      }
-
-      // Compute perspective projection for all points and solve for cx, cy
-      const xr = new Float64Array(N);
-      const yr = new Float64Array(N);
-      const zr = new Float64Array(N);
-      for (let i = 0; i < N; i++) {
-        const [x, y, z] = lmk3D[i];
-        xr[i] = R[0] * x + R[1] * y + R[2] * z;
-        yr[i] = R[3] * x + R[4] * y + R[5] * z;
-        zr[i] = R[6] * x + R[7] * y + R[8] * z;
-      }
-
-      // Solve for cx, cy: obsX_i = fxNorm * xr_i / (zr_i + Z_face) + cx
-      let cxSum = 0, cySum = 0, cnt = 0;
-      for (let i = 0; i < N; i++) {
-        const Zk = zr[i] + Z_face;
-        if (Zk < 0.01) continue;
-        cxSum += pts2D[i][0] - fxNorm * xr[i] / Zk;
-        cySum += pts2D[i][1] - fyNorm * yr[i] / Zk;
-        cnt++;
-      }
-      const cx = cnt > 0 ? cxSum / cnt : 0.5;
-      const cy = cnt > 0 ? cySum / cnt : 0.5;
-
-      return { R, sx: fxNorm, sy: fyNorm, tx: cx, ty: cy, Z_face, perspective: true };
-    }
-
-    // --- Weak-perspective fallback (original code) ---
+    // Rotate all 3D points
     const xr = new Float64Array(N);
     const yr = new Float64Array(N);
     for (let i = 0; i < N; i++) {
@@ -1052,32 +980,35 @@ export class PhotoUploader {
       yr[i] = R[3] * x + R[4] * y + R[5] * z;
     }
 
-    // Isotropic scale: solve for single |s|, tx, ty jointly
-    let A00 = 0, A01 = 0, A02 = 0;
-    let A11 = 0, A12 = 0, A22 = 0;
-    let b0 = 0, b1 = 0, b2 = 0;
-
+    // Solve X: [xr_i 1] [sx; tx] = [obsX_i]  (2x2 system)
+    let Axx = 0, Ax1 = 0, bx0 = 0, bx1 = 0;
     for (let i = 0; i < N; i++) {
-      const xi = xr[i], yi = -yr[i];
-      const obsX = pts2D[i][0], obsY = pts2D[i][1];
-      A00 += xi * xi; A01 += xi; b0 += xi * obsX; b1 += obsX;
-      A00 += yi * yi; A02 += yi; A22 += 1; b0 += yi * obsY; b2 += obsY;
-      A11 += 1;
+      Axx += xr[i] * xr[i];
+      Ax1 += xr[i];
+      bx0 += xr[i] * pts2D[i][0];
+      bx1 += pts2D[i][0];
     }
+    const detX = Axx * N - Ax1 * Ax1;
+    if (Math.abs(detX) < 1e-15) return null;
+    const sx = (bx0 * N - bx1 * Ax1) / detX;
+    const tx = (Axx * bx1 - Ax1 * bx0) / detX;
 
-    const det = A00 * (A11 * A22 - A12 * A12)
-              - A01 * (A01 * A22 - A12 * A02)
-              + A02 * (A01 * A12 - A11 * A02);
-    if (Math.abs(det) < 1e-15) return null;
+    // Solve Y: [yr_i 1] [sy; ty] = [obsY_i]  (2x2 system)
+    let Ayy = 0, Ay1 = 0, by0 = 0, by1 = 0;
+    for (let i = 0; i < N; i++) {
+      Ayy += yr[i] * yr[i];
+      Ay1 += yr[i];
+      by0 += yr[i] * pts2D[i][1];
+      by1 += pts2D[i][1];
+    }
+    const detY = Ayy * N - Ay1 * Ay1;
+    if (Math.abs(detY) < 1e-15) return null;
+    const sy = (by0 * N - by1 * Ay1) / detY;
+    const ty = (Ayy * by1 - Ay1 * by0) / detY;
 
-    const invDet = 1 / det;
-    const s  = invDet * (b0 * (A11 * A22 - A12 * A12) - A01 * (b1 * A22 - A12 * b2) + A02 * (b1 * A12 - A11 * b2));
-    const tx = invDet * (A00 * (b1 * A22 - A12 * b2) - b0 * (A01 * A22 - A12 * A02) + A02 * (A01 * b2 - b1 * A02));
-    const ty = invDet * (A00 * (A11 * b2 - b1 * A12) - A01 * (A01 * b2 - b1 * A02) + b0 * (A01 * A12 - A11 * A02));
+    if (!isFinite(sx) || !isFinite(sy) || Math.abs(sx) < 1e-6) return null;
 
-    if (!isFinite(s) || Math.abs(s) < 1e-6) return null;
-
-    return { R, sx: s, sy: -s, tx, ty };
+    return { R, sx, sy, tx, ty };
   }
 
   /**
@@ -1093,7 +1024,7 @@ export class PhotoUploader {
    * @param {object} meshGen   - FlameMeshGenerator instance
    * @returns {Float64Array} fitted shape parameters (20 components)
    */
-  _fitShapeFromLandmarks(landmarks, mapping, meshGen, perspParams = null) {
+  _fitShapeFromLandmarks(landmarks, mapping, meshGen) {
     const NUM_COMPONENTS = 20;
     const NUM_ITERATIONS = 5;
     const LAMBDA = 0.01;
@@ -1180,62 +1111,37 @@ export class PhotoUploader {
         lmk3D[ki] = p;
       }
 
-      // 2. Estimate camera (fix β)
-      const cam = this._estimateShapeFitCamera(lmk3D, pts2D,
-        perspParams?.Z_face, perspParams?.fxNorm, perspParams?.fyNorm);
+      // 2. Estimate anisotropic weak-perspective camera (fix β)
+      const cam = this._estimateShapeFitCamera(lmk3D, pts2D);
       if (!cam) {
         console.warn(`Shape fitting: Camera estimation failed at iter ${iter}`);
         break;
       }
-      const { R, sx, sy, tx, ty, Z_face: camZ, perspective: isPersp } = cam;
+      const { R, sx, sy, tx, ty } = cam;
 
       // 3. Build design matrix M (2K × C) and target vector d (2K × 1)
+      // Anisotropic weak-perspective: predX = sx * (R·p).x + tx
+      //                               predY = sy * (R·p).y + ty
       const rows = 2 * K;
       const M = new Float64Array(rows * C);
       const d = new Float64Array(rows);
 
       for (let ki = 0; ki < K; ki++) {
-        if (isPersp) {
-          // --- Perspective Gauss-Newton: linearise around current lmk3D ---
-          const [px, py, pz] = lmk3D[ki]; // current position (template + J·β)
-          const xr = R[0] * px + R[1] * py + R[2] * pz;
-          const yr = R[3] * px + R[4] * py + R[5] * pz;
-          const zr = R[6] * px + R[7] * py + R[8] * pz;
-          const Zk = zr + camZ;
-          const Zk2 = Zk * Zk;
+        const [tmx, tmy, tmz] = templateLmk[ki];
+        const txr = R[0] * tmx + R[1] * tmy + R[2] * tmz;
+        const tyr = R[3] * tmx + R[4] * tmy + R[5] * tmz;
 
-          // Residual: observed - perspective projection of current position
-          d[2 * ki]     = pts2D[ki][0] - (sx * xr / Zk + tx);
-          d[2 * ki + 1] = pts2D[ki][1] - (sy * yr / Zk + ty);
+        d[2 * ki]     = pts2D[ki][0] - (sx * txr + tx);
+        d[2 * ki + 1] = pts2D[ki][1] - (sy * tyr + ty);
 
-          // Perspective Jacobian (quotient rule: d/dβ [f·x/(z+Z)] = f·(Z·dx - x·dz)/Z²)
-          for (let c = 0; c < C; c++) {
-            const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
-            const Jx_cam = R[0] * jx + R[1] * jy + R[2] * jz;
-            const Jy_cam = R[3] * jx + R[4] * jy + R[5] * jz;
-            const Jz_cam = R[6] * jx + R[7] * jy + R[8] * jz;
-            M[(2 * ki) * C + c]     = sx * (Zk * Jx_cam - xr * Jz_cam) / Zk2;
-            M[(2 * ki + 1) * C + c] = sy * (Zk * Jy_cam - yr * Jz_cam) / Zk2;
-          }
-        } else {
-          // --- Weak-perspective: linear in β ---
-          const [tmx, tmy, tmz] = templateLmk[ki];
-          const txr = R[0] * tmx + R[1] * tmy + R[2] * tmz;
-          const tyr = R[3] * tmx + R[4] * tmy + R[5] * tmz;
-
-          d[2 * ki]     = pts2D[ki][0] - (sx * txr + tx);
-          d[2 * ki + 1] = pts2D[ki][1] - (sy * tyr + ty);
-
-          for (let c = 0; c < C; c++) {
-            const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
-            M[(2 * ki) * C + c]     = sx * (R[0] * jx + R[1] * jy + R[2] * jz);
-            M[(2 * ki + 1) * C + c] = sy * (R[3] * jx + R[4] * jy + R[5] * jz);
-          }
+        for (let c = 0; c < C; c++) {
+          const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
+          M[(2 * ki) * C + c]     = sx * (R[0] * jx + R[1] * jy + R[2] * jz);
+          M[(2 * ki + 1) * C + c] = sy * (R[3] * jx + R[4] * jy + R[5] * jz);
         }
       }
 
       // 4. Normal equations: (M^T M + λΛ) β = M^T d
-      // Build M^T M (C × C)
       const MtM = new Float64Array(C * C);
       const Mtd = new Float64Array(C);
       for (let a = 0; a < C; a++) {
@@ -1243,27 +1149,20 @@ export class PhotoUploader {
           let sum = 0;
           for (let r = 0; r < rows; r++) sum += M[r * C + a] * M[r * C + b];
           MtM[a * C + b] = sum;
-          MtM[b * C + a] = sum; // symmetric
+          MtM[b * C + a] = sum;
         }
         let rhs = 0;
         for (let r = 0; r < rows; r++) rhs += M[r * C + a] * d[r];
         Mtd[a] = rhs;
       }
 
-      // Add Tikhonov regularisation: λ * Λ where Λ[c,c] = 2^(c/5)
+      // Tikhonov regularisation: λ * 2^(c/5)
       for (let c = 0; c < C; c++) {
         MtM[c * C + c] += LAMBDA * Math.pow(2, c / 5);
       }
 
-      // 5. Solve via Cholesky
-      if (isPersp) {
-        // Gauss-Newton: solve for δβ (increment), since perspective is nonlinear
-        const deltaBeta = this._solveCholesky(MtM, Mtd, C);
-        for (let c = 0; c < C; c++) beta[c] += deltaBeta[c];
-      } else {
-        // Weak-perspective: solve for full β (problem is linear)
-        beta = this._solveCholesky(MtM, Mtd, C);
-      }
+      // 5. Solve for full β (linear problem with weak-perspective)
+      beta = this._solveCholesky(MtM, Mtd, C);
 
       // Log progress
       let reproj = 0;
@@ -1274,23 +1173,13 @@ export class PhotoUploader {
           p[1] += J[ki][1][c] * beta[c];
           p[2] += J[ki][2][c] * beta[c];
         }
-        if (isPersp) {
-          const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
-          const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
-          const zrP = R[6] * p[0] + R[7] * p[1] + R[8] * p[2];
-          const Zk = zrP + camZ;
-          const ex = (sx * xrP / Zk + tx) - pts2D[ki][0];
-          const ey = (sy * yrP / Zk + ty) - pts2D[ki][1];
-          reproj += Math.sqrt(ex * ex + ey * ey);
-        } else {
-          const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
-          const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
-          const ex = (sx * xrP + tx) - pts2D[ki][0];
-          const ey = (sy * yrP + ty) - pts2D[ki][1];
-          reproj += Math.sqrt(ex * ex + ey * ey);
-        }
+        const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
+        const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
+        const ex = (sx * xrP + tx) - pts2D[ki][0];
+        const ey = (sy * yrP + ty) - pts2D[ki][1];
+        reproj += Math.sqrt(ex * ex + ey * ey);
       }
-      console.log(`Shape fitting: iter ${iter}, reproj error = ${(reproj / K).toFixed(6)}${isPersp ? ' (perspective)' : ''}`);
+      console.log(`Shape fitting: iter ${iter}, sx=${sx.toFixed(4)}, sy=${sy.toFixed(4)}, reproj=${(reproj / K).toFixed(6)}`);
     }
 
     // --- Clamp β to valid range ---
@@ -1321,7 +1210,7 @@ export class PhotoUploader {
    *
    * Must be called AFTER _fitShapeFromLandmarks().
    */
-  _fitExpressionFromLandmarks(landmarks, mapping, meshGen, perspParams = null) {
+  _fitExpressionFromLandmarks(landmarks, mapping, meshGen) {
     const NUM_COMPONENTS = 20;
     const NUM_ITERATIONS = 5;
     const LAMBDA = 0.05;
@@ -1426,12 +1315,19 @@ export class PhotoUploader {
       if (LIP_MP_INDICES.has(mpIdx)) lipKiSet.add(ki);
     }
 
-    // --- Detect closed mouth for conditional clamping ---
+    // --- Detect closed mouth using face-relative threshold ---
+    // Use face height (brow to chin) as reference, not absolute pixels
     const lipTop = landmarks[13], lipBot = landmarks[14];
-    const lipGapNorm = Math.abs(lipBot.y - lipTop.y); // normalized [0-1]
-    const lipGapPx = lipGapNorm * Math.max(1, (this._lastImgH || 512));
-    const mouthClosed = lipGapPx < 8;
-    console.log(`Expression fitting: lip gap = ${lipGapPx.toFixed(1)}px, mouth ${mouthClosed ? 'CLOSED' : 'OPEN'}`);
+    const browLmk = landmarks[10], chinLmk = landmarks[152]; // forehead & chin
+    const faceH = Math.sqrt(
+      Math.pow((browLmk.x - chinLmk.x), 2) + Math.pow((browLmk.y - chinLmk.y), 2)
+    );
+    const lipGap = Math.sqrt(
+      Math.pow((lipTop.x - lipBot.x), 2) + Math.pow((lipTop.y - lipBot.y), 2)
+    );
+    const lipRatio = faceH > 0.01 ? lipGap / faceH : 0;
+    const mouthClosed = lipRatio < 0.02; // 2% of face height
+    console.log(`Expression fitting: lip/face ratio = ${(lipRatio * 100).toFixed(2)}% (faceH=${faceH.toFixed(4)}), mouth ${mouthClosed ? 'CLOSED' : 'OPEN'}`);
 
     // --- Alternating optimisation ---
     let epsilon = new Float64Array(C);
@@ -1449,58 +1345,32 @@ export class PhotoUploader {
         lmk3D[ki] = p;
       }
 
-      // 2. Estimate camera (fix ε)
-      const cam = this._estimateShapeFitCamera(lmk3D, pts2D,
-        perspParams?.Z_face, perspParams?.fxNorm, perspParams?.fyNorm);
+      // 2. Estimate anisotropic weak-perspective camera (fix ε)
+      const cam = this._estimateShapeFitCamera(lmk3D, pts2D);
       if (!cam) {
         console.warn(`Expression fitting: Camera failed at iter ${iter}`);
         break;
       }
-      const { R, sx, sy, tx, ty, Z_face: camZ, perspective: isPersp } = cam;
+      const { R, sx, sy, tx, ty } = cam;
 
-      // 3. Build design matrix M and target vector d
+      // 3. Build design matrix M and target vector d (anisotropic weak-perspective)
       const rows = 2 * K;
       const M = new Float64Array(rows * C);
       const d = new Float64Array(rows);
 
       for (let ki = 0; ki < K; ki++) {
-        // Inner lip landmarks get higher weight to prevent mouth-opening artifacts
         const w = lipKiSet.has(ki) ? W_LIP : 1.0;
+        const [bmx, bmy, bmz] = baseLmk[ki];
+        const bxr = R[0] * bmx + R[1] * bmy + R[2] * bmz;
+        const byr = R[3] * bmx + R[4] * bmy + R[5] * bmz;
 
-        if (isPersp) {
-          // --- Perspective Gauss-Newton: linearise around current lmk3D ---
-          const [px, py, pz] = lmk3D[ki]; // current position (base + J·ε)
-          const xr = R[0] * px + R[1] * py + R[2] * pz;
-          const yr = R[3] * px + R[4] * py + R[5] * pz;
-          const zr = R[6] * px + R[7] * py + R[8] * pz;
-          const Zk = zr + camZ;
-          const Zk2 = Zk * Zk;
+        d[2 * ki]     = w * (pts2D[ki][0] - (sx * bxr + tx));
+        d[2 * ki + 1] = w * (pts2D[ki][1] - (sy * byr + ty));
 
-          d[2 * ki]     = w * (pts2D[ki][0] - (sx * xr / Zk + tx));
-          d[2 * ki + 1] = w * (pts2D[ki][1] - (sy * yr / Zk + ty));
-
-          for (let c = 0; c < C; c++) {
-            const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
-            const Jx_cam = R[0] * jx + R[1] * jy + R[2] * jz;
-            const Jy_cam = R[3] * jx + R[4] * jy + R[5] * jz;
-            const Jz_cam = R[6] * jx + R[7] * jy + R[8] * jz;
-            M[(2 * ki) * C + c]     = w * sx * (Zk * Jx_cam - xr * Jz_cam) / Zk2;
-            M[(2 * ki + 1) * C + c] = w * sy * (Zk * Jy_cam - yr * Jz_cam) / Zk2;
-          }
-        } else {
-          // --- Weak-perspective: linear in ε ---
-          const [bmx, bmy, bmz] = baseLmk[ki];
-          const bxr = R[0] * bmx + R[1] * bmy + R[2] * bmz;
-          const byr = R[3] * bmx + R[4] * bmy + R[5] * bmz;
-
-          d[2 * ki]     = w * (pts2D[ki][0] - (sx * bxr + tx));
-          d[2 * ki + 1] = w * (pts2D[ki][1] - (sy * byr + ty));
-
-          for (let c = 0; c < C; c++) {
-            const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
-            M[(2 * ki) * C + c]     = w * sx * (R[0] * jx + R[1] * jy + R[2] * jz);
-            M[(2 * ki + 1) * C + c] = w * sy * (R[3] * jx + R[4] * jy + R[5] * jz);
-          }
+        for (let c = 0; c < C; c++) {
+          const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
+          M[(2 * ki) * C + c]     = w * sx * (R[0] * jx + R[1] * jy + R[2] * jz);
+          M[(2 * ki + 1) * C + c] = w * sy * (R[3] * jx + R[4] * jy + R[5] * jz);
         }
       }
 
@@ -1519,7 +1389,7 @@ export class PhotoUploader {
         Mtd[a] = rhs;
       }
 
-      // Tikhonov: λ * 2^(c/5) (match shape fitting growth rate)
+      // Tikhonov: λ * 2^(c/5)
       for (let c = 0; c < C; c++) {
         MtM[c * C + c] += LAMBDA * Math.pow(2, c / 5);
       }
@@ -1544,15 +1414,8 @@ export class PhotoUploader {
         }
       }
 
-      // 5. Solve via Cholesky
-      if (isPersp) {
-        // Gauss-Newton: solve for δε (increment), since perspective is nonlinear
-        const deltaEps = this._solveCholesky(MtM, Mtd, C);
-        for (let c = 0; c < C; c++) epsilon[c] += deltaEps[c];
-      } else {
-        // Weak-perspective: solve for full ε (problem is linear)
-        epsilon = this._solveCholesky(MtM, Mtd, C);
-      }
+      // 5. Solve for full ε (linear problem with weak-perspective)
+      epsilon = this._solveCholesky(MtM, Mtd, C);
 
       // Log progress
       let reproj = 0;
@@ -1563,34 +1426,24 @@ export class PhotoUploader {
           p[1] += J[ki][1][c] * epsilon[c];
           p[2] += J[ki][2][c] * epsilon[c];
         }
-        if (isPersp) {
-          const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
-          const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
-          const zrP = R[6] * p[0] + R[7] * p[1] + R[8] * p[2];
-          const Zk = zrP + camZ;
-          const ex = (sx * xrP / Zk + tx) - pts2D[ki][0];
-          const ey = (sy * yrP / Zk + ty) - pts2D[ki][1];
-          reproj += Math.sqrt(ex * ex + ey * ey);
-        } else {
-          const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
-          const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
-          const ex = (sx * xrP + tx) - pts2D[ki][0];
-          const ey = (sy * yrP + ty) - pts2D[ki][1];
-          reproj += Math.sqrt(ex * ex + ey * ey);
-        }
+        const xrP = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
+        const yrP = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
+        const ex = (sx * xrP + tx) - pts2D[ki][0];
+        const ey = (sy * yrP + ty) - pts2D[ki][1];
+        reproj += Math.sqrt(ex * ex + ey * ey);
       }
-      console.log(`Expression fitting: iter ${iter}, reproj error = ${(reproj / K).toFixed(6)}${isPersp ? ' (perspective)' : ''}`);
+      console.log(`Expression fitting: iter ${iter}, sx=${sx.toFixed(4)}, sy=${sy.toFixed(4)}, reproj=${(reproj / K).toFixed(6)}`);
     }
 
     // --- Clamp ε to valid range ---
     for (let c = 0; c < C; c++) {
       epsilon[c] = Math.max(-2.0, Math.min(2.0, epsilon[c]));
     }
-    // Conditional clamping: if mouth is closed in photo, restrict jaw/mouth components
+    // Hard constraint: if mouth is closed in photo, zero out jaw-opening components
     if (mouthClosed) {
-      epsilon[0] = Math.max(-1.0, Math.min(1.0, epsilon[0])); // jaw open
-      epsilon[1] = Math.max(-1.0, Math.min(1.0, epsilon[1])); // secondary jaw
-      console.log('Expression fitting: mouth closed → clamped ε[0], ε[1] to ±1.0');
+      epsilon[0] = 0; // jaw open → force zero
+      epsilon[1] = 0; // secondary jaw → force zero
+      console.log('Expression fitting: mouth closed → hard set ε[0]=ε[1]=0');
     }
 
     // --- Apply expression to mesh ---
@@ -1606,29 +1459,23 @@ export class PhotoUploader {
 
   /**
    * Project all 5023 FLAME position vertices into image space.
+   * Uses anisotropic weak-perspective: imgX = sx * Xrot + tx, imgY = sy * Yrot + ty.
    * @returns {Float32Array} 5023*2 array of [imgX, imgY] pairs (normalized 0-1)
    */
   _projectAllVertices(meshGen, cam) {
     const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
     const nVerts = verts.length / 3;
     const result = new Float32Array(nVerts * 2);
-    const { R, fx, fy, tx, ty, tz, meanZ } = cam;
+    const { R, sx, sy, tx, ty } = cam;
 
     for (let i = 0; i < nVerts; i++) {
       const x = verts[i * 3], y = verts[i * 3 + 1], z = verts[i * 3 + 2];
       // Rotate
       const xr = R[0] * x + R[1] * y + R[2] * z;
       const yr = R[3] * x + R[4] * y + R[5] * z;
-      const zr = R[6] * x + R[7] * y + R[8] * z;
-      // Perspective projection
-      const zCam = zr - meanZ + tz;
-      if (zCam > 0.001) {
-        result[i * 2] = fx * xr / zCam + tx;
-        result[i * 2 + 1] = fy * yr / zCam + ty;
-      } else {
-        result[i * 2] = -999;
-        result[i * 2 + 1] = -999;
-      }
+      // Anisotropic weak-perspective projection
+      result[i * 2] = sx * xr + tx;
+      result[i * 2 + 1] = sy * yr + ty;
     }
 
     // Diagnostic: count in-bounds vertices
@@ -1651,12 +1498,10 @@ export class PhotoUploader {
     const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
     const nFaces = posFaces.length / 3;
     const visibility = new Float32Array(nFaces);
-    const { R, meanZ, tz } = cam;
+    const { R } = cam;
 
-    // Camera position in model space: looking along -Z in camera space,
-    // so camera is at R^T * [0, 0, -tz] in model space
-    // For face culling we just need the view direction in model space
-    // View direction = R^T * [0, 0, 1] (camera looks along +Z in camera space)
+    // View direction in model space = R^T * [0, 0, 1]
+    // (camera looks along +Z in camera space)
     const viewDirX = R[2]; // R^T column 2 = R row 2... actually row 0 col 2, row 1 col 2, row 2 col 2
     const viewDirY = R[5];
     const viewDirZ = R[8];
@@ -1762,6 +1607,68 @@ export class PhotoUploader {
 
     console.log(`Inner mouth mask: ${innerMouthVerts.size} vertices, ${excludedFaces.size} faces excluded`);
     return excludedFaces;
+  }
+
+  /**
+   * Build debug overlay: draw MediaPipe landmarks (green) + projected FLAME mesh outline (red)
+   * on the source photo. Stored as data URL for visual inspection.
+   */
+  _buildDebugOverlay(img, landmarks, projectedCoords, meshGen, srcW, srcH) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = srcW;
+      canvas.height = srcH;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, srcW, srcH);
+
+      // Draw MediaPipe landmarks (green dots)
+      ctx.fillStyle = '#00ff00';
+      for (let i = 0; i < Math.min(landmarks.length, 478); i++) {
+        const lm = landmarks[i];
+        if (isNaN(lm.x) || isNaN(lm.y)) continue;
+        const px = lm.x * srcW, py = lm.y * srcH;
+        ctx.beginPath();
+        ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Draw projected FLAME mesh edges (red lines) — sample face edges for outline
+      const posFaces = meshGen.flameFaces;
+      const nFaces = posFaces.length / 3;
+      ctx.strokeStyle = 'rgba(255, 0, 0, 0.3)';
+      ctx.lineWidth = 0.5;
+      const maxFacesToDraw = Math.min(nFaces, 2000); // limit for performance
+      for (let f = 0; f < maxFacesToDraw; f++) {
+        const i0 = posFaces[f * 3], i1 = posFaces[f * 3 + 1], i2 = posFaces[f * 3 + 2];
+        const x0 = projectedCoords[i0 * 2] * srcW, y0 = projectedCoords[i0 * 2 + 1] * srcH;
+        const x1 = projectedCoords[i1 * 2] * srcW, y1 = projectedCoords[i1 * 2 + 1] * srcH;
+        const x2 = projectedCoords[i2 * 2] * srcW, y2 = projectedCoords[i2 * 2 + 1] * srcH;
+        // Skip out-of-bounds
+        if (x0 < -srcW || x0 > srcW * 2 || y0 < -srcH || y0 > srcH * 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.closePath();
+        ctx.stroke();
+      }
+
+      // Draw 105 mapped FLAME landmark correspondences (cyan = projected FLAME, green = MediaPipe)
+      const mpIndices = meshGen._mediaPipeMapping?.landmark_indices;
+      if (mpIndices) {
+        ctx.fillStyle = '#00ffff';
+        for (let i = 0; i < mpIndices.length; i++) {
+          const mpIdx = mpIndices[i];
+          if (mpIdx >= landmarks.length) continue;
+          // This would need FLAME projected position at this landmark — skip for now
+        }
+      }
+
+      this._debugOverlayUrl = canvas.toDataURL('image/jpeg', 0.85);
+      console.log('PhotoUploader DIAG: Debug overlay saved to _debugOverlayUrl');
+    } catch (err) {
+      console.warn('PhotoUploader DIAG: Debug overlay failed:', err.message);
+    }
   }
 
   /**
@@ -2609,24 +2516,37 @@ export class PhotoUploader {
       });
     }
 
-    // Sort by luminance and trim 10% from each end
-    samples.sort((a, b) => a.lum - b.lum);
-    const trimStart = Math.floor(samples.length * 0.1);
-    const trimEnd = Math.ceil(samples.length * 0.9);
-    const trimmed = samples.slice(trimStart, trimEnd);
-
-    let prSum = 0, pgSum = 0, pbSum = 0;
-    let arSum = 0, agSum = 0, abSum = 0;
-    for (const s of trimmed) {
-      prSum += s.pr; pgSum += s.pg; pbSum += s.pb;
-      arSum += s.ar; agSum += s.ag; abSum += s.ab;
+    // Use MEDIAN for robust color correction (resistant to outliers/shadow/beard)
+    if (samples.length < 10) {
+      console.warn(`Albedo color correction: only ${samples.length} samples — using defaults`);
+      const crR = 1, crG = 1, crB = 1;
+      for (let i = 0; i < size * size; i++) {
+        const u = (i % size) / size;
+        const v = Math.floor(i / size) / size;
+        const ax = Math.min(albedoRes - 1, Math.floor(u * albedoRes));
+        const ay = Math.min(albedoRes - 1, Math.floor(v * albedoRes));
+        const ai = (ay * albedoRes + ax) * 3;
+        ad[i * 4] = albedo[ai]; ad[i * 4 + 1] = albedo[ai + 1]; ad[i * 4 + 2] = albedo[ai + 2]; ad[i * 4 + 3] = 255;
+      }
+      return albedoData;
     }
-    const sampleCount = trimmed.length;
 
-    const crR = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, prSum / (arSum + 1))) : 1;
-    const crG = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pgSum / (agSum + 1))) : 1;
-    const crB = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pbSum / (abSum + 1))) : 1;
-    console.log(`Albedo color correction: R=${crR.toFixed(3)}, G=${crG.toFixed(3)}, B=${crB.toFixed(3)}, samples=${sampleCount}`);
+    // Compute per-channel ratios and take median
+    const ratiosR = [], ratiosG = [], ratiosB = [];
+    for (const s of samples) {
+      if (s.ar > 10) ratiosR.push(s.pr / s.ar);
+      if (s.ag > 10) ratiosG.push(s.pg / s.ag);
+      if (s.ab > 10) ratiosB.push(s.pb / s.ab);
+    }
+    ratiosR.sort((a, b) => a - b);
+    ratiosG.sort((a, b) => a - b);
+    ratiosB.sort((a, b) => a - b);
+
+    const median = arr => arr.length > 0 ? arr[Math.floor(arr.length / 2)] : 1;
+    const crR = Math.max(0.3, Math.min(3.0, median(ratiosR)));
+    const crG = Math.max(0.3, Math.min(3.0, median(ratiosG)));
+    const crB = Math.max(0.3, Math.min(3.0, median(ratiosB)));
+    console.log(`Albedo color correction (MEDIAN): R=${crR.toFixed(3)}, G=${crG.toFixed(3)}, B=${crB.toFixed(3)}, samples=${samples.length}`);
 
     // Fill every pixel with color-corrected albedo
     for (let i = 0; i < size * size; i++) {
