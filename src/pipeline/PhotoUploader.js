@@ -602,9 +602,12 @@ export class PhotoUploader {
     // --- 4c. Build inner mouth exclusion mask ---
     const excludedFaces = this._buildInnerMouthMask(meshGen);
 
-    // --- 5. Rasterise all visible faces (excluding inner mouth) ---
+    // --- 4d. Build face boundary mask on source photo ---
+    const faceBoundaryMask = this._buildFaceBoundaryMask(landmarks, srcW, srcH);
+
+    // --- 5. Rasterise all visible faces (excluding inner mouth, face boundary masked) ---
     const outImageData = ctx.createImageData(size, size);
-    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces);
+    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask);
 
     // --- 5a. Apply UV mask: clear pixels outside valid UV footprint ---
     this._applyUVMask(outImageData, size, uvMask);
@@ -1181,9 +1184,9 @@ export class PhotoUploader {
    * Must be called AFTER _fitShapeFromLandmarks().
    */
   _fitExpressionFromLandmarks(landmarks, mapping, meshGen) {
-    const NUM_COMPONENTS = 10;
-    const NUM_ITERATIONS = 3;
-    const LAMBDA = 0.1;
+    const NUM_COMPONENTS = 20;
+    const NUM_ITERATIONS = 5;
+    const LAMBDA = 0.01;
     const LAMBDA_SYM = 0.05;
 
     const mpIndices = mapping.landmark_indices;
@@ -1334,23 +1337,27 @@ export class PhotoUploader {
         Mtd[a] = rhs;
       }
 
-      // Tikhonov: λ * 2^(c/3) (stronger progressive penalty than shape)
+      // Tikhonov: λ * 2^(c/5) (match shape fitting growth rate)
       for (let c = 0; c < C; c++) {
-        MtM[c * C + c] += LAMBDA * Math.pow(2, c / 3);
+        MtM[c * C + c] += LAMBDA * Math.pow(2, c / 5);
       }
 
       // Symmetry regularisation: penalise asymmetric expression effects
-      // For each symmetric pair (a, b), add penalty for J[a]·ε ≠ J[b]·ε (mirrored)
+      // For each symmetric pair (a, b), penalty: || (J[a] - J[b]_mirrored) · ε ||²
+      // This adds the outer product S[ca][cb] = Σ_pairs (diff_ca · diff_cb) to MtM
       for (const [a, b] of symPairs) {
         for (let ca = 0; ca < C; ca++) {
-          for (let cb = 0; cb < C; cb++) {
-            // Penalty on (J[a] - J[b]_mirrored) · ε
-            // Mirror: flip X component of J[b]
-            const diffX = J[a][0][ca] - (-J[b][0][cb]); // X is mirrored
-            const diffY = J[a][1][ca] - J[b][1][cb];
-            const diffZ = J[a][2][ca] - J[b][2][cb];
-            const pen = LAMBDA_SYM * (diffX * diffX + diffY * diffY + diffZ * diffZ);
-            if (ca === cb) MtM[ca * C + cb] += pen;
+          // diff_ca = J[a][:,ca] - mirror(J[b][:,ca])  (mirror = negate X)
+          const dXa = J[a][0][ca] + J[b][0][ca]; // J[a].x - (-J[b].x) = J[a].x + J[b].x
+          const dYa = J[a][1][ca] - J[b][1][ca];
+          const dZa = J[a][2][ca] - J[b][2][ca];
+          for (let cb = ca; cb < C; cb++) {
+            const dXb = J[a][0][cb] + J[b][0][cb];
+            const dYb = J[a][1][cb] - J[b][1][cb];
+            const dZb = J[a][2][cb] - J[b][2][cb];
+            const pen = LAMBDA_SYM * (dXa * dXb + dYa * dYb + dZa * dZb);
+            MtM[ca * C + cb] += pen;
+            if (ca !== cb) MtM[cb * C + ca] += pen; // symmetric matrix
           }
         }
       }
@@ -1550,6 +1557,98 @@ export class PhotoUploader {
 
     console.log(`Inner mouth mask: ${innerMouthVerts.size} vertices, ${excludedFaces.size} faces excluded`);
     return excludedFaces;
+  }
+
+  /**
+   * Build a binary mask on the source photo that marks pixels inside the face boundary.
+   * Uses MediaPipe's face oval landmarks to create a polygon, then rasterises it.
+   *
+   * @param {Array} landmarks - MediaPipe 478 landmarks (normalised 0-1)
+   * @param {number} srcW - source image width in pixels
+   * @param {number} srcH - source image height in pixels
+   * @returns {Uint8Array} srcW*srcH binary mask (1 = inside face, 0 = outside)
+   */
+  _buildFaceBoundaryMask(landmarks, srcW, srcH) {
+    // MediaPipe standard face oval contour (ordered: forehead → jaw → forehead)
+    const FACE_OVAL = [
+      10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
+      365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58,
+      132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+    ];
+
+    // Extract polygon vertices in pixel coordinates
+    const polyX = [];
+    const polyY = [];
+    for (const idx of FACE_OVAL) {
+      if (idx >= landmarks.length) continue;
+      const lm = landmarks[idx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+      polyX.push(lm.x * srcW);
+      polyY.push(lm.y * srcH);
+    }
+
+    if (polyX.length < 10) {
+      console.warn('Face boundary mask: insufficient landmarks, disabling');
+      const mask = new Uint8Array(srcW * srcH);
+      mask.fill(1);
+      return mask;
+    }
+
+    // Expand polygon outward by a small margin to avoid cutting face edges
+    let cx = 0, cy = 0;
+    for (let i = 0; i < polyX.length; i++) { cx += polyX[i]; cy += polyY[i]; }
+    cx /= polyX.length;
+    cy /= polyY.length;
+
+    const MARGIN_PX = 5;
+    for (let i = 0; i < polyX.length; i++) {
+      const dx = polyX[i] - cx;
+      const dy = polyY[i] - cy;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len > 0.01) {
+        polyX[i] += (dx / len) * MARGIN_PX;
+        polyY[i] += (dy / len) * MARGIN_PX;
+      }
+    }
+
+    // Scanline polygon rasterisation
+    const mask = new Uint8Array(srcW * srcH);
+    const nVerts = polyX.length;
+
+    let minY = srcH, maxY = 0;
+    for (let i = 0; i < nVerts; i++) {
+      if (polyY[i] < minY) minY = Math.floor(polyY[i]);
+      if (polyY[i] > maxY) maxY = Math.ceil(polyY[i]);
+    }
+    minY = Math.max(0, minY);
+    maxY = Math.min(srcH - 1, maxY);
+
+    for (let y = minY; y <= maxY; y++) {
+      const intersections = [];
+      for (let i = 0; i < nVerts; i++) {
+        const j = (i + 1) % nVerts;
+        const yi = polyY[i], yj = polyY[j];
+        if ((yi <= y && yj > y) || (yj <= y && yi > y)) {
+          const t = (y - yi) / (yj - yi);
+          intersections.push(polyX[i] + t * (polyX[j] - polyX[i]));
+        }
+      }
+      intersections.sort((a, b) => a - b);
+
+      for (let k = 0; k < intersections.length - 1; k += 2) {
+        const xStart = Math.max(0, Math.ceil(intersections[k]));
+        const xEnd = Math.min(srcW - 1, Math.floor(intersections[k + 1]));
+        for (let x = xStart; x <= xEnd; x++) {
+          mask[y * srcW + x] = 1;
+        }
+      }
+    }
+
+    let count = 0;
+    for (let i = 0; i < mask.length; i++) if (mask[i]) count++;
+    console.log(`Face boundary mask: ${count}/${srcW * srcH} pixels inside face (${(count / (srcW * srcH) * 100).toFixed(1)}%)`);
+
+    return mask;
   }
 
   /**
@@ -2232,8 +2331,9 @@ export class PhotoUploader {
 
     const albedoRes = meshGen.albedoResolution || 512;
 
-    // Compute color correction ratio (photo avg / albedo avg)
-    let prSum = 0, pgSum = 0, pbSum = 0, arSum = 0, agSum = 0, abSum = 0, sampleCount = 0;
+    // Compute robust color correction using trimmed mean
+    // Exclude extreme luminance values and trim 10% from each end to resist outliers
+    const samples = [];
     for (let i = 0; i < size * size; i++) {
       if (pd[i * 4 + 3] < 200) continue;
       const u = (i % size) / size;
@@ -2241,14 +2341,37 @@ export class PhotoUploader {
       const ax = Math.min(albedoRes - 1, Math.floor(u * albedoRes));
       const ay = Math.min(albedoRes - 1, Math.floor(v * albedoRes));
       const ai = (ay * albedoRes + ax) * 3;
-      prSum += pd[i * 4]; pgSum += pd[i * 4 + 1]; pbSum += pd[i * 4 + 2];
-      arSum += albedo[ai]; agSum += albedo[ai + 1]; abSum += albedo[ai + 2];
-      sampleCount++;
+
+      // Filter out extreme luminance (shadows, highlights, artifacts)
+      const pLum = pd[i * 4] * 0.2126 + pd[i * 4 + 1] * 0.7152 + pd[i * 4 + 2] * 0.0722;
+      const aLum = albedo[ai] * 0.2126 + albedo[ai + 1] * 0.7152 + albedo[ai + 2] * 0.0722;
+      if (pLum < 20 || pLum > 240 || aLum < 20 || aLum > 240) continue;
+
+      samples.push({
+        pr: pd[i * 4], pg: pd[i * 4 + 1], pb: pd[i * 4 + 2],
+        ar: albedo[ai], ag: albedo[ai + 1], ab: albedo[ai + 2],
+        lum: pLum
+      });
     }
+
+    // Sort by luminance and trim 10% from each end
+    samples.sort((a, b) => a.lum - b.lum);
+    const trimStart = Math.floor(samples.length * 0.1);
+    const trimEnd = Math.ceil(samples.length * 0.9);
+    const trimmed = samples.slice(trimStart, trimEnd);
+
+    let prSum = 0, pgSum = 0, pbSum = 0;
+    let arSum = 0, agSum = 0, abSum = 0;
+    for (const s of trimmed) {
+      prSum += s.pr; pgSum += s.pg; pbSum += s.pb;
+      arSum += s.ar; agSum += s.ag; abSum += s.ab;
+    }
+    const sampleCount = trimmed.length;
 
     const crR = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, prSum / (arSum + 1))) : 1;
     const crG = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pgSum / (agSum + 1))) : 1;
     const crB = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pbSum / (abSum + 1))) : 1;
+    console.log(`Albedo color correction: R=${crR.toFixed(3)}, G=${crG.toFixed(3)}, B=${crB.toFixed(3)}, samples=${sampleCount}`);
 
     // Fill every pixel with color-corrected albedo
     for (let i = 0; i < size * size; i++) {
@@ -2388,7 +2511,7 @@ export class PhotoUploader {
    * Rasterise all FLAME UV faces, sampling the source photo via
    * TPS-interpolated per-vertex image coordinates.
    */
-  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null) {
+  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null, faceBoundaryMask = null) {
     const out = outImageData.data;
     const nFaces = uvFaces.length / 3;
 
@@ -2448,6 +2571,13 @@ export class PhotoUploader {
           const clampY = Math.max(0, Math.min(imgY, 0.9999));
           // Skip pixels far outside (>15% beyond edge) — those are extrapolation artifacts
           if (imgX < -0.15 || imgX > 1.15 || imgY < -0.15 || imgY > 1.15) continue;
+
+          // Skip source pixels outside the face boundary polygon
+          if (faceBoundaryMask) {
+            const mx = Math.min(srcW - 1, Math.max(0, Math.round(clampX * (srcW - 1))));
+            const my = Math.min(srcH - 1, Math.max(0, Math.round(clampY * (srcH - 1))));
+            if (!faceBoundaryMask[my * srcW + mx]) continue;
+          }
 
           const outIdx = (py * size + px) * 4;
           const rgba = this._bilinearSample(srcData, srcW, srcH, clampX * srcW, clampY * srcH);
