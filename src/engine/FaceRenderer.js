@@ -242,23 +242,23 @@ export class FaceRenderer {
   _setPhotoLighting() {
     // Reduce directional lights to minimize double-shadowing
     if (this.lights.key) {
-      this.lights.key.intensity = 0.8;           // was 2.0
-      this.lights.key.color.set(0xffffff);         // neutral white (was warm)
+      this.lights.key.intensity = 0.5;             // reduced — photo already has its own shading
+      this.lights.key.color.set(0xffffff);         // neutral white
       this.lights.key.castShadow = false;          // no shadow casting on photo texture
     }
     if (this.lights.fill) {
-      this.lights.fill.intensity = 0.6;            // was 0.7
-      this.lights.fill.color.set(0xffffff);         // neutral (was cool blue)
+      this.lights.fill.intensity = 0.5;            // balanced with key for even illumination
+      this.lights.fill.color.set(0xffffff);        // neutral
     }
     if (this.lights.rim) {
-      this.lights.rim.intensity = 0.3;             // was 0.5
+      this.lights.rim.intensity = 0.15;            // subtle rim only
     }
     if (this.lights.ambient) {
-      this.lights.ambient.intensity = 0.7;         // was 0.4 — boost ambient for even lighting
-      this.lights.ambient.color.set(0xffffff);      // neutral (was purple)
+      this.lights.ambient.intensity = 0.9;         // high ambient — let photo texture dominate
+      this.lights.ambient.color.set(0xffffff);     // neutral
     }
     if (this.lights.rectArea) {
-      this.lights.rectArea.intensity = 0.6;        // was 1.2
+      this.lights.rectArea.intensity = 0.4;        // reduced area light
     }
     console.log('FaceRenderer: Switched to photo-neutral lighting');
   }
@@ -399,11 +399,11 @@ export class FaceRenderer {
         // When loading a photo-based albedo, optimize material for color fidelity
         this.faceMaterial.color.set(0xffffff);
         if (this.faceMaterial.isMeshPhysicalMaterial) {
-          this.faceMaterial.sheen = 0.02;          // minimize sheen overlay
-          this.faceMaterial.clearcoat = 0.01;       // near-zero clearcoat
+          this.faceMaterial.sheen = 0.0;            // no sheen — photo already has specularity
+          this.faceMaterial.clearcoat = 0.0;         // no clearcoat — prevents wet plastic look
           this.faceMaterial.transmission = 0;        // no subsurface transmission
           this.faceMaterial.thickness = 0;
-          this.faceMaterial.roughness = 0.65;        // slightly matte for skin
+          this.faceMaterial.roughness = 0.75;        // more matte — photo texture IS the shading
         }
         // Switch to neutral lighting to avoid double-shadowing
         this._setPhotoLighting();

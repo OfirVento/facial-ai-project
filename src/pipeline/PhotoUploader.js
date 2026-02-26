@@ -201,8 +201,16 @@ export class PhotoUploader {
       console.warn('PhotoUploader: Expression fitting failed, using neutral:', err.message);
     }
 
-    // Dense Projection (camera-based texture baking)
-    const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen);
+    // Estimate ONE camera from the final fitted mesh — used for ALL projection
+    const fittedCamera = this._estimateCameraFromLandmarks(landmarks, mapping, meshGen);
+    if (fittedCamera) {
+      console.log(`PhotoUploader: Fitted camera: sx=${fittedCamera.sx.toFixed(4)}, sy=${fittedCamera.sy.toFixed(4)}, tx=${fittedCamera.tx.toFixed(4)}, ty=${fittedCamera.ty.toFixed(4)}`);
+    } else {
+      console.error('PhotoUploader: Camera estimation failed on fitted mesh!');
+    }
+
+    // Dense Projection (camera-based texture baking) — uses the SAME camera as fitting
+    const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen, fittedCamera);
     if (result) {
       console.log('PhotoUploader: Dense projection succeeded');
       return result;
@@ -535,7 +543,7 @@ export class PhotoUploader {
    * 4. Rasterises visible faces using the existing mesh rasteriser
    * 5. Fills non-visible regions from the FLAME albedo texture
    */
-  _denseProjectTextureToUV(img, landmarks, mapping, meshGen) {
+  _denseProjectTextureToUV(img, landmarks, mapping, meshGen, fittedCamera = null) {
     const size = 2048;
     const canvas = document.createElement('canvas');
     canvas.width = size;
@@ -553,16 +561,23 @@ export class PhotoUploader {
     srcCanvas.getContext('2d').drawImage(img, 0, 0, srcW, srcH);
     const srcData = srcCanvas.getContext('2d').getImageData(0, 0, srcW, srcH).data;
 
-    // --- 1. Estimate camera from 105 2D-3D correspondences ---
-    const cameraParams = this._estimateCameraFromLandmarks(landmarks, mapping, meshGen);
-    if (!cameraParams) {
-      console.error('PhotoUploader: Camera estimation FAILED — cannot proceed');
-      return null;
+    // --- 1. Use fitted camera (single camera end-to-end) or estimate fresh ---
+    let cameraParams;
+    if (fittedCamera) {
+      cameraParams = fittedCamera;
+      console.log(`PhotoUploader DENSE: Using FITTED camera (consistent with shape/expr fitting)`);
+    } else {
+      cameraParams = this._estimateCameraFromLandmarks(landmarks, mapping, meshGen);
+      if (!cameraParams) {
+        console.error('PhotoUploader: Camera estimation FAILED — cannot proceed');
+        return null;
+      }
+      console.warn('PhotoUploader DENSE: No fitted camera provided — estimated independently (may diverge!)');
     }
-    console.log(`PhotoUploader DIAG: camera sx=${cameraParams.sx.toFixed(4)}, sy=${cameraParams.sy.toFixed(4)}, tx=${cameraParams.tx.toFixed(4)}, ty=${cameraParams.ty.toFixed(4)}`);
+    console.log(`PhotoUploader DENSE: camera sx=${cameraParams.sx.toFixed(4)}, sy=${cameraParams.sy.toFixed(4)}, tx=${cameraParams.tx.toFixed(4)}, ty=${cameraParams.ty.toFixed(4)}`);
 
     // --- 2. Project all position vertices to image space ---
-    const projectedCoords = this._projectAllVertices(meshGen, cameraParams);
+    const { coords: projectedCoords, depths: vertexDepths } = this._projectAllVertices(meshGen, cameraParams);
 
     // --- 3. Compute per-face visibility (backface culling) ---
     const faceVisibility = this._computeFaceVisibility(meshGen, cameraParams);
@@ -574,6 +589,9 @@ export class PhotoUploader {
     const uvCoords = meshGen.flameUVCoords;
     const uvFaces = meshGen.flameUVFaces;
     const uvImgCoords = this._mapProjectionToUV(projectedCoords, meshGen, faceVisibility);
+
+    // --- 4a-depth. Map position-vertex depths to UV-vertex depths ---
+    const uvDepths = this._mapDepthsToUV(vertexDepths, meshGen);
 
     // --- Reuse diagnostic overlays from TPS path ---
     const mpIndices = mapping.landmark_indices;
@@ -610,10 +628,17 @@ export class PhotoUploader {
 
     // --- 5. Rasterise all visible faces (excluding inner mouth, face boundary masked) ---
     const outImageData = ctx.createImageData(size, size);
-    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask);
+    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask, uvDepths);
 
     // --- 5a. Apply UV mask: clear pixels outside valid UV footprint ---
     this._applyUVMask(outImageData, size, uvMask);
+
+    // --- 5a2. Edge dilation: expand mapped pixels into unmapped (alpha=0) regions ---
+    // Reduces hard seam between photo texture and albedo fill
+    this._dilateEdges(outImageData, size, 12);
+
+    // --- 5a3. Eye socket feathering: smooth boundary at eye sockets ---
+    this._featherEyeSockets(outImageData, size, landmarks, mapping, uvCoords, uvFaces);
 
     // --- Diagnostic: pixel coverage ---
     let mappedPixels = 0;
@@ -621,7 +646,7 @@ export class PhotoUploader {
     for (let i = 0; i < totalPixels; i++) {
       if (outImageData.data[i * 4 + 3] > 0) mappedPixels++;
     }
-    console.log(`PhotoUploader DENSE: Mapped ${mappedPixels}/${totalPixels} pixels (${(mappedPixels / totalPixels * 100).toFixed(1)}%) before fill`);
+    console.log(`PhotoUploader DENSE: Mapped ${mappedPixels}/${totalPixels} pixels (${(mappedPixels / totalPixels * 100).toFixed(1)}%) after dilation`);
 
     // --- 5b. Delight the texture: remove baked-in photo shading ---
     // Divides out low-frequency luminance so 3D lighting can create proper shadows.
@@ -1460,12 +1485,16 @@ export class PhotoUploader {
   /**
    * Project all 5023 FLAME position vertices into image space.
    * Uses anisotropic weak-perspective: imgX = sx * Xrot + tx, imgY = sy * Yrot + ty.
-   * @returns {Float32Array} 5023*2 array of [imgX, imgY] pairs (normalized 0-1)
+   * Also computes rotated Z-depth for each vertex (used by depth buffer in rasterizer).
+   * @returns {{ coords: Float32Array, depths: Float32Array }}
+   *   coords: 5023*2 array of [imgX, imgY] pairs (normalized 0-1)
+   *   depths: 5023 array of rotated Z values (camera-space depth)
    */
   _projectAllVertices(meshGen, cam) {
     const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
     const nVerts = verts.length / 3;
-    const result = new Float32Array(nVerts * 2);
+    const coords = new Float32Array(nVerts * 2);
+    const depths = new Float32Array(nVerts);
     const { R, sx, sy, tx, ty } = cam;
 
     for (let i = 0; i < nVerts; i++) {
@@ -1473,20 +1502,23 @@ export class PhotoUploader {
       // Rotate
       const xr = R[0] * x + R[1] * y + R[2] * z;
       const yr = R[3] * x + R[4] * y + R[5] * z;
+      const zr = R[6] * x + R[7] * y + R[8] * z;
       // Anisotropic weak-perspective projection
-      result[i * 2] = sx * xr + tx;
-      result[i * 2 + 1] = sy * yr + ty;
+      coords[i * 2] = sx * xr + tx;
+      coords[i * 2 + 1] = sy * yr + ty;
+      // Camera-space depth (closer = smaller z in camera coords)
+      depths[i] = zr;
     }
 
     // Diagnostic: count in-bounds vertices
     let inBounds = 0;
     for (let i = 0; i < nVerts; i++) {
-      const ix = result[i * 2], iy = result[i * 2 + 1];
+      const ix = coords[i * 2], iy = coords[i * 2 + 1];
       if (ix >= 0 && ix < 1 && iy >= 0 && iy < 1) inBounds++;
     }
     console.log(`PhotoUploader DENSE: ${inBounds}/${nVerts} vertices project into image bounds`);
 
-    return result;
+    return { coords, depths };
   }
 
   /**
@@ -1528,15 +1560,16 @@ export class PhotoUploader {
       const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
       const cosAngle = nLen > 1e-10 ? dot / nLen : 0;
 
-      // Smooth visibility: fully visible when cosAngle > 0.15, fade at silhouette
-      if (cosAngle > 0.25) {
+      // Smooth visibility: fully visible when facing camera, kill grazing angles
+      if (cosAngle > 0.3) {
         visibility[f] = 1.0;
         visibleCount++;
-      } else if (cosAngle > -0.10) {
-        // Wide smooth transition at silhouette for gradual blending
-        visibility[f] = (cosAngle + 0.10) / 0.35;
+      } else if (cosAngle > 0.1) {
+        // Narrow fade zone — only allow near-front faces
+        visibility[f] = (cosAngle - 0.1) / 0.2;
         visibleCount++;
       } else {
+        // Grazing or back-facing — kill completely
         visibility[f] = 0;
       }
     }
@@ -1681,11 +1714,13 @@ export class PhotoUploader {
    * @returns {Uint8Array} srcW*srcH binary mask (1 = inside face, 0 = outside)
    */
   _buildFaceBoundaryMask(landmarks, srcW, srcH) {
-    // MediaPipe standard face oval contour (ordered: forehead → jaw → forehead)
+    // MediaPipe face oval + extended forehead/temple landmarks for better scalp coverage
     const FACE_OVAL = [
       10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
       365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58,
-      132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+      132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
+      // Additional forehead/temple landmarks for scalp coverage
+      151, 9, 8, 168
     ];
 
     // Extract polygon vertices in pixel coordinates
@@ -1712,7 +1747,7 @@ export class PhotoUploader {
     cx /= polyX.length;
     cy /= polyY.length;
 
-    const MARGIN_PX = 5;
+    const MARGIN_PX = 15;
     for (let i = 0; i < polyX.length; i++) {
       const dx = polyX[i] - cx;
       const dy = polyY[i] - cy;
@@ -1782,6 +1817,22 @@ export class PhotoUploader {
   }
 
   /**
+   * Map position-vertex camera depths to UV-vertex depths.
+   * @param {Float32Array} vertexDepths - 5023 camera-space Z values
+   * @param {Object} meshGen
+   * @returns {Float32Array} 5118 UV-vertex depth values
+   */
+  _mapDepthsToUV(vertexDepths, meshGen) {
+    const uvToPosMap = meshGen.uvToPosMap;
+    const nUV = meshGen.flameUVVertexCount;
+    const result = new Float32Array(nUV);
+    for (let i = 0; i < nUV; i++) {
+      result[i] = vertexDepths[uvToPosMap[i]];
+    }
+    return result;
+  }
+
+  /**
    * Build a boolean UV mask: for each pixel in the texture, is it inside any UV triangle?
    * Prevents writing texture data to invalid UV regions (seam gaps, outside face area).
    * @returns {Uint8Array} size*size mask (1=valid, 0=invalid)
@@ -1837,6 +1888,190 @@ export class PhotoUploader {
       }
     }
     if (cleared > 0) console.log(`PhotoUploader DENSE: UV mask cleared ${cleared} out-of-footprint pixels`);
+  }
+
+  /**
+   * Dilate mapped texture edges outward into unmapped (alpha=0) regions.
+   * Copies nearest mapped pixel color outward, reducing hard seam between
+   * photo texture and albedo fill.
+   * @param {ImageData} imageData - texture image data (modified in place)
+   * @param {number} size - texture width/height
+   * @param {number} iterations - number of dilation passes (pixels of expansion)
+   */
+  _dilateEdges(imageData, size, iterations = 12) {
+    const data = imageData.data;
+    let totalDilated = 0;
+
+    for (let iter = 0; iter < iterations; iter++) {
+      // Find boundary pixels: alpha=0 that have at least one alpha>0 neighbor
+      const toFill = [];
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const idx = (y * size + x) * 4;
+          if (data[idx + 3] > 0) continue; // already mapped
+
+          // Check 4-connected neighbors for mapped pixels
+          let rSum = 0, gSum = 0, bSum = 0, aSum = 0, count = 0;
+          const offsets = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+          for (const [dx, dy] of offsets) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+            const nIdx = (ny * size + nx) * 4;
+            if (data[nIdx + 3] > 0) {
+              rSum += data[nIdx];
+              gSum += data[nIdx + 1];
+              bSum += data[nIdx + 2];
+              aSum += data[nIdx + 3];
+              count++;
+            }
+          }
+
+          if (count > 0) {
+            toFill.push([idx, Math.round(rSum / count), Math.round(gSum / count), Math.round(bSum / count), Math.round(aSum / count)]);
+          }
+        }
+      }
+
+      // Apply all fills for this pass
+      for (const [idx, r, g, b, a] of toFill) {
+        data[idx] = r;
+        data[idx + 1] = g;
+        data[idx + 2] = b;
+        data[idx + 3] = a;
+      }
+
+      totalDilated += toFill.length;
+      if (toFill.length === 0) break; // no more boundary pixels
+    }
+
+    if (totalDilated > 0) {
+      console.log(`PhotoUploader DENSE: Edge dilation filled ${totalDilated} pixels over ${iterations} passes`);
+    }
+  }
+
+  /**
+   * Feather eye socket boundaries in UV space.
+   * Maps MediaPipe eye contour landmarks to UV, identifies nearby texture boundary pixels,
+   * and applies a small Gaussian blur to smooth the transition.
+   * @param {ImageData} imageData - texture image data (modified in place)
+   * @param {number} size - texture width/height
+   * @param {Array} landmarks - MediaPipe landmarks
+   * @param {Object} mapping - FLAME-MediaPipe mapping
+   * @param {Float32Array} uvCoords - UV coordinates
+   * @param {Uint32Array} uvFaces - UV face indices
+   */
+  _featherEyeSockets(imageData, size, landmarks, mapping, uvCoords, uvFaces) {
+    if (!landmarks || !mapping) return;
+
+    const data = imageData.data;
+    const RADIUS = 3; // Gaussian feather radius in pixels
+
+    // MediaPipe eye contour landmarks
+    const RIGHT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+    const LEFT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
+    const eyeLandmarks = [...RIGHT_EYE, ...LEFT_EYE];
+
+    // Map eye landmarks to UV space
+    const mpIndices = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords = mapping.lmk_b_coords;
+    const eyeUVPoints = [];
+
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (!eyeLandmarks.includes(mpIdx)) continue;
+      if (mpIdx >= landmarks.length) continue;
+
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const uvi0 = uvFaces[fi * 3], uvi1 = uvFaces[fi * 3 + 1], uvi2 = uvFaces[fi * 3 + 2];
+      const u = bc[0] * uvCoords[uvi0 * 2] + bc[1] * uvCoords[uvi1 * 2] + bc[2] * uvCoords[uvi2 * 2];
+      const v = bc[0] * uvCoords[uvi0 * 2 + 1] + bc[1] * uvCoords[uvi1 * 2 + 1] + bc[2] * uvCoords[uvi2 * 2 + 1];
+      eyeUVPoints.push([u * size, v * size]);
+    }
+
+    if (eyeUVPoints.length < 4) {
+      console.log('Eye feathering: insufficient UV eye points, skipping');
+      return;
+    }
+
+    // Build a mask of pixels within RADIUS*2 of any eye UV landmark
+    const SEARCH_RADIUS = RADIUS * 3;
+    const featherPixels = new Set();
+    for (const [eu, ev] of eyeUVPoints) {
+      const minX = Math.max(0, Math.floor(eu - SEARCH_RADIUS));
+      const maxX = Math.min(size - 1, Math.ceil(eu + SEARCH_RADIUS));
+      const minY = Math.max(0, Math.floor(ev - SEARCH_RADIUS));
+      const maxY = Math.min(size - 1, Math.ceil(ev + SEARCH_RADIUS));
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const dist = Math.sqrt((x - eu) ** 2 + (y - ev) ** 2);
+          if (dist <= SEARCH_RADIUS) {
+            featherPixels.add(y * size + x);
+          }
+        }
+      }
+    }
+
+    // Apply Gaussian blur only to feather region pixels that are at mapped/unmapped boundary
+    // (pixels where alpha transitions from >0 to 0 within RADIUS)
+    const kernel = [];
+    let kernelSum = 0;
+    const sigma = RADIUS / 2;
+    for (let dy = -RADIUS; dy <= RADIUS; dy++) {
+      for (let dx = -RADIUS; dx <= RADIUS; dx++) {
+        const w = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma));
+        kernel.push({ dx, dy, w });
+        kernelSum += w;
+      }
+    }
+    kernel.forEach(k => k.w /= kernelSum);
+
+    // Snapshot original data for reading
+    const orig = new Uint8ClampedArray(data);
+    let feathered = 0;
+
+    for (const pixIdx of featherPixels) {
+      const x = pixIdx % size;
+      const y = Math.floor(pixIdx / size);
+      const idx = pixIdx * 4;
+      if (orig[idx + 3] === 0) continue; // unmapped — skip
+
+      // Check if this is near a boundary (has unmapped neighbor within RADIUS)
+      let nearBoundary = false;
+      for (let dy = -RADIUS; dy <= RADIUS && !nearBoundary; dy++) {
+        for (let dx = -RADIUS; dx <= RADIUS && !nearBoundary; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+          if (orig[(ny * size + nx) * 4 + 3] === 0) nearBoundary = true;
+        }
+      }
+      if (!nearBoundary) continue;
+
+      // Apply Gaussian blur from original data
+      let rAcc = 0, gAcc = 0, bAcc = 0, aAcc = 0, wAcc = 0;
+      for (const { dx, dy, w } of kernel) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+        const nIdx = (ny * size + nx) * 4;
+        if (orig[nIdx + 3] === 0) continue; // skip unmapped in blur
+        rAcc += orig[nIdx] * w;
+        gAcc += orig[nIdx + 1] * w;
+        bAcc += orig[nIdx + 2] * w;
+        aAcc += orig[nIdx + 3] * w;
+        wAcc += w;
+      }
+
+      if (wAcc > 0) {
+        data[idx] = Math.round(rAcc / wAcc);
+        data[idx + 1] = Math.round(gAcc / wAcc);
+        data[idx + 2] = Math.round(bAcc / wAcc);
+        data[idx + 3] = Math.round(aAcc / wAcc);
+        feathered++;
+      }
+    }
+
+    console.log(`Eye feathering: ${feathered} pixels feathered near ${eyeUVPoints.length} eye UV points`);
   }
 
   /**
@@ -2686,9 +2921,15 @@ export class PhotoUploader {
    * Rasterise all FLAME UV faces, sampling the source photo via
    * TPS-interpolated per-vertex image coordinates.
    */
-  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null, faceBoundaryMask = null) {
+  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null, faceBoundaryMask = null, uvDepths = null) {
     const out = outImageData.data;
     const nFaces = uvFaces.length / 3;
+
+    // --- Depth buffer: closest surface wins (prevents overlapping face bleed) ---
+    const depthBuffer = new Float32Array(size * size);
+    depthBuffer.fill(Infinity);
+    let invertedSkipped = 0;
+    let depthRejected = 0;
 
     for (let f = 0; f < nFaces; f++) {
       // Skip inner mouth / excluded faces
@@ -2711,9 +2952,21 @@ export class PhotoUploader {
       const ix1 = uvImgCoords[vi1 * 2], iy1 = uvImgCoords[vi1 * 2 + 1];
       const ix2 = uvImgCoords[vi2 * 2], iy2 = uvImgCoords[vi2 * 2 + 1];
 
+      // --- Triangle inversion check: skip if projected 2D triangle has flipped ---
+      const signedArea2D = (ix1 - ix0) * (iy2 - iy0) - (ix2 - ix0) * (iy1 - iy0);
+      if (signedArea2D < 0) {
+        invertedSkipped++;
+        continue;
+      }
+
       // Skip faces whose image coords are entirely far outside image
       if (Math.min(ix0, ix1, ix2) > 1.5 || Math.max(ix0, ix1, ix2) < -0.5 ||
           Math.min(iy0, iy1, iy2) > 1.5 || Math.max(iy0, iy1, iy2) < -0.5) continue;
+
+      // Per-vertex depths for depth buffer interpolation
+      const d0 = uvDepths ? uvDepths[vi0] : 0;
+      const d1 = uvDepths ? uvDepths[vi1] : 0;
+      const d2 = uvDepths ? uvDepths[vi2] : 0;
 
       // Bounding box in pixel space
       const minPx = Math.max(0, Math.floor(Math.min(u0, u1, u2) * size));
@@ -2736,6 +2989,17 @@ export class PhotoUploader {
           const w2 = 1.0 - w0 - w1;
 
           if (w0 < -0.001 || w1 < -0.001 || w2 < -0.001) continue;
+
+          // --- Depth test: only write if this fragment is closer ---
+          if (uvDepths) {
+            const pixelDepth = w0 * d0 + w1 * d1 + w2 * d2;
+            const dbIdx = py * size + px;
+            if (pixelDepth >= depthBuffer[dbIdx]) {
+              depthRejected++;
+              continue;
+            }
+            depthBuffer[dbIdx] = pixelDepth;
+          }
 
           // Interpolate image coordinates via barycentric weights
           const imgX = w0 * ix0 + w1 * ix1 + w2 * ix2;
@@ -2763,6 +3027,8 @@ export class PhotoUploader {
         }
       }
     }
+
+    console.log(`PhotoUploader RASTER: ${invertedSkipped} faces skipped (triangle inversion), ${depthRejected} fragments rejected (depth buffer)`);
   }
 
   /**
