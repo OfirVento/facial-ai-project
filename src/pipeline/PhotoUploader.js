@@ -635,7 +635,7 @@ export class PhotoUploader {
 
     // --- 5a2. Edge dilation: expand mapped pixels into unmapped (alpha=0) regions ---
     // Reduces hard seam between photo texture and albedo fill
-    this._dilateEdges(outImageData, size, 12);
+    this._dilateEdges(outImageData, size, 20);
 
     // --- 5a3. Eye socket feathering: smooth boundary at eye sockets ---
     this._featherEyeSockets(outImageData, size, landmarks, mapping, uvCoords, uvFaces);
@@ -652,10 +652,13 @@ export class PhotoUploader {
     // Divides out low-frequency luminance so 3D lighting can create proper shadows.
     this._delightTexture(outImageData, size);
 
+    // --- 5b2. Color smoothing: reduce extreme local color variations ---
+    this._smoothTextureColors(outImageData, size);
+
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    this._softenAlphaBoundary(outImageData, size, Math.max(6, Math.round(size / 128)));
+    this._softenAlphaBoundary(outImageData, size, Math.max(10, Math.round(size / 80)));
 
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
@@ -1038,6 +1041,22 @@ export class PhotoUploader {
 
     if (!isFinite(sx) || !isFinite(sy) || Math.abs(sx) < 1e-6) return null;
 
+    // Soft aspect ratio constraint: prevent sx/sy from diverging more than 15%
+    // from isotropic. This forces the SHAPE to absorb width/height differences
+    // rather than the camera absorbing everything.
+    const absRatio = Math.abs(sx / sy);
+    const MAX_ANISO = 1.15; // allow up to 15% anisotropy
+    if (absRatio > MAX_ANISO || absRatio < 1 / MAX_ANISO) {
+      const isoScale = Math.sqrt(Math.abs(sx * sy)); // geometric mean
+      const sxSign = Math.sign(sx), sySign = Math.sign(sy);
+      const clampedSx = sxSign * Math.min(isoScale * MAX_ANISO, Math.abs(sx));
+      const clampedSy = sySign * Math.min(isoScale * MAX_ANISO, Math.abs(sy));
+      // Blend: 60% clamped, 40% original (soft constraint)
+      const finalSx = 0.6 * clampedSx + 0.4 * sx;
+      const finalSy = 0.6 * clampedSy + 0.4 * sy;
+      return { R, sx: finalSx, sy: finalSy, tx, ty };
+    }
+
     return { R, sx, sy, tx, ty };
   }
 
@@ -1055,9 +1074,9 @@ export class PhotoUploader {
    * @returns {Float64Array} fitted shape parameters (20 components)
    */
   _fitShapeFromLandmarks(landmarks, mapping, meshGen) {
-    const NUM_COMPONENTS = 20;
-    const NUM_ITERATIONS = 5;
-    const LAMBDA = 0.01;
+    const NUM_COMPONENTS = 25;   // more components → finer face shape control
+    const NUM_ITERATIONS = 6;
+    const LAMBDA = 0.005;       // lighter regularisation → shape absorbs more geometry
 
     const mpIndices = mapping.landmark_indices;
     const faceIndices = mapping.lmk_face_idx;
@@ -2267,6 +2286,74 @@ export class PhotoUploader {
         console.log(`PhotoUploader DENSE: Brightness OK: avgLum=${postAvg.toFixed(1)}, no correction needed`);
       }
     }
+  }
+
+  /**
+   * Gently smooth the texture colors to reduce reddish patches and uneven tones.
+   * Blends each pixel 25% toward its local average (box-blurred version).
+   * Only operates on mapped pixels (alpha > 0). Preserves detail while reducing extremes.
+   */
+  _smoothTextureColors(imageData, size) {
+    const data = imageData.data;
+    const N = size * size;
+    const BLEND = 0.25;  // 25% blend toward local average
+    const RADIUS = Math.max(4, Math.round(size / 256)); // ~8px at 2048
+
+    // Extract RGB for mapped pixels
+    const channels = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+    for (let i = 0; i < N; i++) {
+      if (data[i * 4 + 3] === 0) continue;
+      channels[0][i] = data[i * 4];
+      channels[1][i] = data[i * 4 + 1];
+      channels[2][i] = data[i * 4 + 2];
+    }
+
+    // Box blur each channel
+    for (let ch = 0; ch < 3; ch++) {
+      const src = channels[ch];
+      const tmp = new Float32Array(N);
+      // Horizontal pass
+      for (let y = 0; y < size; y++) {
+        let sum = 0, count = 0;
+        for (let x = 0; x < Math.min(RADIUS, size); x++) {
+          const idx = y * size + x;
+          if (data[idx * 4 + 3] > 0) { sum += src[idx]; count++; }
+        }
+        for (let x = 0; x < size; x++) {
+          if (x + RADIUS < size) {
+            const idx = y * size + x + RADIUS;
+            if (data[idx * 4 + 3] > 0) { sum += src[idx]; count++; }
+          }
+          if (x - RADIUS - 1 >= 0) {
+            const idx = y * size + x - RADIUS - 1;
+            if (data[idx * 4 + 3] > 0) { sum -= src[idx]; count--; }
+          }
+          tmp[y * size + x] = count > 0 ? sum / count : src[y * size + x];
+        }
+      }
+      // Vertical pass
+      const blurred = new Float32Array(N);
+      for (let x = 0; x < size; x++) {
+        let sum = 0, count = 0;
+        for (let y = 0; y < Math.min(RADIUS, size); y++) {
+          sum += tmp[y * size + x]; count++;
+        }
+        for (let y = 0; y < size; y++) {
+          if (y + RADIUS < size) { sum += tmp[(y + RADIUS) * size + x]; count++; }
+          if (y - RADIUS - 1 >= 0) { sum -= tmp[(y - RADIUS - 1) * size + x]; count--; }
+          blurred[y * size + x] = sum / count;
+        }
+      }
+
+      // Blend: pixel = (1-BLEND)*original + BLEND*blurred
+      for (let i = 0; i < N; i++) {
+        if (data[i * 4 + 3] === 0) continue;
+        const smoothed = (1 - BLEND) * src[i] + BLEND * blurred[i];
+        data[i * 4 + ch] = Math.round(Math.max(0, Math.min(255, smoothed)));
+      }
+    }
+
+    console.log(`PhotoUploader DENSE: Color smoothing applied (blend=${BLEND}, radius=${RADIUS})`);
   }
 
   /**
