@@ -192,6 +192,13 @@ export class PhotoUploader {
       console.warn('PhotoUploader: Shape fitting failed, using mean shape:', err.message);
     }
 
+    // Fit FLAME expression to match the photo's mouth/eyes/brows
+    try {
+      this._fitExpressionFromLandmarks(landmarks, mapping, meshGen);
+    } catch (err) {
+      console.warn('PhotoUploader: Expression fitting failed, using neutral:', err.message);
+    }
+
     // Try Dense Projection first (camera-based), fall back to TPS
     try {
       const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen);
@@ -592,9 +599,12 @@ export class PhotoUploader {
     // --- 4b. Build UV mask (valid UV footprint only) ---
     const uvMask = this._buildUVMask(size, uvCoords, uvFaces);
 
-    // --- 5. Rasterise all visible faces ---
+    // --- 4c. Build inner mouth exclusion mask ---
+    const excludedFaces = this._buildInnerMouthMask(meshGen);
+
+    // --- 5. Rasterise all visible faces (excluding inner mouth) ---
     const outImageData = ctx.createImageData(size, size);
-    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility);
+    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces);
 
     // --- 5a. Apply UV mask: clear pixels outside valid UV footprint ---
     this._applyUVMask(outImageData, size, uvMask);
@@ -611,9 +621,6 @@ export class PhotoUploader {
     // Divides out low-frequency luminance so 3D lighting can create proper shadows.
     this._delightTexture(outImageData, size);
 
-    // --- 5c. Blur the alpha boundary for smooth photo→albedo transition ---
-    this._blurAlphaBoundary(outImageData, size);
-
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
     preFillCanvas.width = size;
@@ -621,9 +628,11 @@ export class PhotoUploader {
     preFillCanvas.getContext('2d').putImageData(outImageData, 0, 0);
     this._debugPreFillTexture = preFillCanvas.toDataURL('image/png');
 
-    // --- 6. Fill unmapped areas with FLAME albedo ---
-    this._fillWithFlameAlbedo(outImageData, meshGen);
-    ctx.putImageData(outImageData, 0, 0);
+    // --- 6. Mask-normalized Laplacian pyramid blending ---
+    // Build full-coverage albedo layer, then blend with photo using 5-level pyramid
+    const albedoLayer = this._prepareAlbedoLayer(outImageData, meshGen, size);
+    const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
+    ctx.putImageData(blendedData, 0, 0);
 
     console.log('PhotoUploader: Dense projection texture complete');
     this._debugFinalTexture = canvas.toDataURL('image/png');
@@ -1161,6 +1170,229 @@ export class PhotoUploader {
   }
 
   /**
+   * Fit FLAME expression PCA parameters (ε) to 105 MediaPipe landmarks.
+   *
+   * Same alternating least-squares as shape fitting, but:
+   *   - Uses expression basis (not shape basis)
+   *   - Starts from shaped vertices (not template)
+   *   - Fits 10 components with higher regularisation (λ=0.1)
+   *   - Adds symmetry penalty to prevent lopsided expressions
+   *
+   * Must be called AFTER _fitShapeFromLandmarks().
+   */
+  _fitExpressionFromLandmarks(landmarks, mapping, meshGen) {
+    const NUM_COMPONENTS = 10;
+    const NUM_ITERATIONS = 3;
+    const LAMBDA = 0.1;
+    const LAMBDA_SYM = 0.05;
+
+    const mpIndices = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords = mapping.lmk_b_coords;
+    const posFaces = meshGen.flameFaces;
+    // Use shaped vertices (after shape fitting) as the base
+    const shapedVerts = meshGen._flameShapedVertices ?? meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
+    const exprBasis = meshGen._flameExpressionBasis;
+    const { expressionComponents } = meshGen._flameMeta;
+
+    if (!exprBasis || !shapedVerts) {
+      console.warn('Expression fitting: FLAME expression data not available');
+      return null;
+    }
+
+    const C = Math.min(NUM_COMPONENTS, expressionComponents);
+
+    // --- Extract valid 2D-3D landmark correspondences ---
+    const validIndices = [];
+    const pts2D = [];
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (mpIdx >= landmarks.length) continue;
+      const lm = landmarks[mpIdx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+      validIndices.push(i);
+      pts2D.push([lm.x, lm.y]);
+    }
+
+    const K = validIndices.length;
+    if (K < 10) {
+      console.warn(`Expression fitting: Only ${K} valid landmarks, need ≥10`);
+      return null;
+    }
+    console.log(`Expression fitting: ${K} landmarks, ${C} PCA components`);
+
+    // --- Pre-compute per-landmark shaped positions and expression Jacobian ---
+    const baseLmk = new Array(K); // K × 3 (shaped vertex positions at landmarks)
+    const J = new Array(K);       // K × 3 × C (expression basis Jacobian)
+
+    for (let ki = 0; ki < K; ki++) {
+      const i = validIndices[ki];
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const pi0 = posFaces[fi * 3], pi1 = posFaces[fi * 3 + 1], pi2 = posFaces[fi * 3 + 2];
+
+      // Shaped position (barycentric interpolation on shaped vertices)
+      const bx = bc[0] * shapedVerts[pi0 * 3]     + bc[1] * shapedVerts[pi1 * 3]     + bc[2] * shapedVerts[pi2 * 3];
+      const by = bc[0] * shapedVerts[pi0 * 3 + 1] + bc[1] * shapedVerts[pi1 * 3 + 1] + bc[2] * shapedVerts[pi2 * 3 + 1];
+      const bz = bc[0] * shapedVerts[pi0 * 3 + 2] + bc[1] * shapedVerts[pi1 * 3 + 2] + bc[2] * shapedVerts[pi2 * 3 + 2];
+      baseLmk[ki] = [bx, by, bz];
+
+      // Expression Jacobian (same layout as shape basis)
+      const Jk = [new Float64Array(C), new Float64Array(C), new Float64Array(C)];
+      for (let c = 0; c < C; c++) {
+        for (let coord = 0; coord < 3; coord++) {
+          Jk[coord][c] =
+            bc[0] * exprBasis[(pi0 * 3 + coord) * expressionComponents + c] +
+            bc[1] * exprBasis[(pi1 * 3 + coord) * expressionComponents + c] +
+            bc[2] * exprBasis[(pi2 * 3 + coord) * expressionComponents + c];
+        }
+      }
+      J[ki] = Jk;
+    }
+
+    // --- Build symmetry pairs for regularisation ---
+    // Find left/right landmark pairs by checking X-coordinate symmetry
+    // Landmarks with similar Y but opposite X are symmetric pairs
+    const symPairs = [];
+    const used = new Set();
+    for (let a = 0; a < K; a++) {
+      if (used.has(a)) continue;
+      const xa = baseLmk[a][0], ya = baseLmk[a][1];
+      if (Math.abs(xa) < 0.005) continue; // Skip midline landmarks
+      let bestB = -1, bestDist = 0.01;
+      for (let b = a + 1; b < K; b++) {
+        if (used.has(b)) continue;
+        const xb = baseLmk[b][0], yb = baseLmk[b][1];
+        // Mirror: similar Y, opposite X
+        const dist = Math.abs(xa + xb) + Math.abs(ya - yb);
+        if (dist < bestDist) { bestDist = dist; bestB = b; }
+      }
+      if (bestB >= 0) {
+        symPairs.push([a, bestB]);
+        used.add(a);
+        used.add(bestB);
+      }
+    }
+    console.log(`Expression fitting: ${symPairs.length} symmetric landmark pairs`);
+
+    // --- Alternating optimisation ---
+    let epsilon = new Float64Array(C);
+
+    for (let iter = 0; iter < NUM_ITERATIONS; iter++) {
+      // 1. Compute current 3D landmark positions: lmk3D = baseLmk + J · ε
+      const lmk3D = new Array(K);
+      for (let ki = 0; ki < K; ki++) {
+        const p = [baseLmk[ki][0], baseLmk[ki][1], baseLmk[ki][2]];
+        for (let c = 0; c < C; c++) {
+          p[0] += J[ki][0][c] * epsilon[c];
+          p[1] += J[ki][1][c] * epsilon[c];
+          p[2] += J[ki][2][c] * epsilon[c];
+        }
+        lmk3D[ki] = p;
+      }
+
+      // 2. Estimate camera (fix ε)
+      const cam = this._estimateShapeFitCamera(lmk3D, pts2D);
+      if (!cam) {
+        console.warn(`Expression fitting: Camera failed at iter ${iter}`);
+        break;
+      }
+      const { R, sx, sy, tx, ty } = cam;
+
+      // 3. Build design matrix M and target vector d
+      const rows = 2 * K;
+      const M = new Float64Array(rows * C);
+      const d = new Float64Array(rows);
+
+      for (let ki = 0; ki < K; ki++) {
+        const [bmx, bmy, bmz] = baseLmk[ki];
+        const bxr = R[0] * bmx + R[1] * bmy + R[2] * bmz;
+        const byr = R[3] * bmx + R[4] * bmy + R[5] * bmz;
+
+        d[2 * ki]     = pts2D[ki][0] - (sx * bxr + tx);
+        d[2 * ki + 1] = pts2D[ki][1] - (sy * byr + ty);
+
+        for (let c = 0; c < C; c++) {
+          const jx = J[ki][0][c], jy = J[ki][1][c], jz = J[ki][2][c];
+          M[(2 * ki) * C + c]     = sx * (R[0] * jx + R[1] * jy + R[2] * jz);
+          M[(2 * ki + 1) * C + c] = sy * (R[3] * jx + R[4] * jy + R[5] * jz);
+        }
+      }
+
+      // 4. Normal equations: (M^T M + λΛ + λ_sym S) ε = M^T d
+      const MtM = new Float64Array(C * C);
+      const Mtd = new Float64Array(C);
+      for (let a = 0; a < C; a++) {
+        for (let b = a; b < C; b++) {
+          let sum = 0;
+          for (let r = 0; r < rows; r++) sum += M[r * C + a] * M[r * C + b];
+          MtM[a * C + b] = sum;
+          MtM[b * C + a] = sum;
+        }
+        let rhs = 0;
+        for (let r = 0; r < rows; r++) rhs += M[r * C + a] * d[r];
+        Mtd[a] = rhs;
+      }
+
+      // Tikhonov: λ * 2^(c/3) (stronger progressive penalty than shape)
+      for (let c = 0; c < C; c++) {
+        MtM[c * C + c] += LAMBDA * Math.pow(2, c / 3);
+      }
+
+      // Symmetry regularisation: penalise asymmetric expression effects
+      // For each symmetric pair (a, b), add penalty for J[a]·ε ≠ J[b]·ε (mirrored)
+      for (const [a, b] of symPairs) {
+        for (let ca = 0; ca < C; ca++) {
+          for (let cb = 0; cb < C; cb++) {
+            // Penalty on (J[a] - J[b]_mirrored) · ε
+            // Mirror: flip X component of J[b]
+            const diffX = J[a][0][ca] - (-J[b][0][cb]); // X is mirrored
+            const diffY = J[a][1][ca] - J[b][1][cb];
+            const diffZ = J[a][2][ca] - J[b][2][cb];
+            const pen = LAMBDA_SYM * (diffX * diffX + diffY * diffY + diffZ * diffZ);
+            if (ca === cb) MtM[ca * C + cb] += pen;
+          }
+        }
+      }
+
+      // 5. Solve via Cholesky
+      epsilon = this._solveCholesky(MtM, Mtd, C);
+
+      // Log progress
+      let reproj = 0;
+      for (let ki = 0; ki < K; ki++) {
+        const p = [baseLmk[ki][0], baseLmk[ki][1], baseLmk[ki][2]];
+        for (let c = 0; c < C; c++) {
+          p[0] += J[ki][0][c] * epsilon[c];
+          p[1] += J[ki][1][c] * epsilon[c];
+          p[2] += J[ki][2][c] * epsilon[c];
+        }
+        const xr = R[0] * p[0] + R[1] * p[1] + R[2] * p[2];
+        const yr = R[3] * p[0] + R[4] * p[1] + R[5] * p[2];
+        const ex = (sx * xr + tx) - pts2D[ki][0];
+        const ey = (sy * yr + ty) - pts2D[ki][1];
+        reproj += Math.sqrt(ex * ex + ey * ey);
+      }
+      console.log(`Expression fitting: iter ${iter}, reproj error = ${(reproj / K).toFixed(6)}`);
+    }
+
+    // --- Clamp ε to valid range ---
+    for (let c = 0; c < C; c++) {
+      epsilon[c] = Math.max(-2.0, Math.min(2.0, epsilon[c]));
+    }
+
+    // --- Apply expression to mesh ---
+    const exprParams = new Array(expressionComponents).fill(0);
+    for (let c = 0; c < C; c++) exprParams[c] = epsilon[c];
+    meshGen.applyExpressionParams(exprParams);
+
+    console.log(`Expression fitting: ε[0..4] = [${epsilon.slice(0, 5).map(v => v.toFixed(3)).join(', ')}]`);
+    console.log('Expression fitting: Applied expression params to mesh');
+
+    return epsilon;
+  }
+
+  /**
    * Project all 5023 FLAME position vertices into image space.
    * @returns {Float32Array} 5023*2 array of [imgX, imgY] pairs (normalized 0-1)
    */
@@ -1254,6 +1486,70 @@ export class PhotoUploader {
 
     console.log(`PhotoUploader DENSE: ${visibleCount}/${nFaces} faces visible`);
     return visibility;
+  }
+
+  /**
+   * Build a set of face indices to exclude from rasterization (inner mouth, eyeballs).
+   * Identifies unlabeled vertices near the lip region and behind the lip surface.
+   * @returns {Set<number>} face indices to skip during rasterization
+   */
+  _buildInnerMouthMask(meshGen) {
+    const regions = meshGen._flameRegions;
+    const verts = meshGen._flameCurrentVertices ?? meshGen._flameTemplateVertices;
+    const faces = meshGen.flameFaces;
+    const nVerts = verts.length / 3;
+    const nFaces = faces.length / 3;
+
+    if (!regions || !regions.zones) {
+      console.warn('Inner mouth mask: No region data available');
+      return new Set();
+    }
+
+    // Collect all vertices that belong to any labeled region
+    const labeledVerts = new Set();
+    const lipVerts = new Set();
+    for (const [name, data] of Object.entries(regions.zones)) {
+      const vs = Array.isArray(data) ? data : (data.vertex_indices || []);
+      vs.forEach(v => labeledVerts.add(v));
+      if (name.startsWith('lip_') || name.startsWith('lip_corner')) {
+        vs.forEach(v => lipVerts.add(v));
+      }
+    }
+
+    // Compute lip bounding box
+    let lipXmin = 1e9, lipXmax = -1e9, lipYmin = 1e9, lipYmax = -1e9, lipZsum = 0;
+    for (const v of lipVerts) {
+      const x = verts[v * 3], y = verts[v * 3 + 1], z = verts[v * 3 + 2];
+      if (x < lipXmin) lipXmin = x; if (x > lipXmax) lipXmax = x;
+      if (y < lipYmin) lipYmin = y; if (y > lipYmax) lipYmax = y;
+      lipZsum += z;
+    }
+    const lipZmean = lipZsum / lipVerts.size;
+
+    // Find unlabeled vertices near the lip region and behind the lip surface
+    const innerMouthVerts = new Set();
+    const margin = 0.02; // 2cm margin around lip bbox
+    for (let v = 0; v < nVerts; v++) {
+      if (labeledVerts.has(v)) continue;
+      const x = verts[v * 3], y = verts[v * 3 + 1], z = verts[v * 3 + 2];
+      if (x >= lipXmin - margin && x <= lipXmax + margin &&
+          y >= lipYmin - margin && y <= lipYmax + margin &&
+          z < lipZmean + 0.005) {
+        innerMouthVerts.add(v);
+      }
+    }
+
+    // Find faces that touch any inner mouth vertex
+    const excludedFaces = new Set();
+    for (let f = 0; f < nFaces; f++) {
+      const v0 = faces[f * 3], v1 = faces[f * 3 + 1], v2 = faces[f * 3 + 2];
+      if (innerMouthVerts.has(v0) || innerMouthVerts.has(v1) || innerMouthVerts.has(v2)) {
+        excludedFaces.add(f);
+      }
+    }
+
+    console.log(`Inner mouth mask: ${innerMouthVerts.size} vertices, ${excludedFaces.size} faces excluded`);
+    return excludedFaces;
   }
 
   /**
@@ -1638,6 +1934,339 @@ export class PhotoUploader {
   }
 
   // -----------------------------------------------------------------------
+  // Mask-Normalized Laplacian Pyramid Blending
+  // -----------------------------------------------------------------------
+
+  /**
+   * Separable Gaussian blur on a Float32Array image.
+   * @param {Float32Array} data - size*size*channels flat array
+   * @param {number} w - width
+   * @param {number} h - height
+   * @param {number} ch - channels (3 or 4)
+   * @param {number} radius - blur radius
+   * @returns {Float32Array} blurred copy
+   */
+  _gaussBlur(data, w, h, ch, radius) {
+    const out = new Float32Array(data.length);
+    const temp = new Float32Array(data.length);
+    const r = Math.max(1, Math.round(radius));
+    const diam = 2 * r + 1;
+
+    // Horizontal pass: data → temp
+    for (let y = 0; y < h; y++) {
+      for (let c = 0; c < ch; c++) {
+        let sum = 0;
+        // Init window
+        for (let dx = -r; dx <= r; dx++) {
+          const x = Math.max(0, Math.min(w - 1, dx));
+          sum += data[(y * w + x) * ch + c];
+        }
+        temp[(y * w + 0) * ch + c] = sum / diam;
+        for (let x = 1; x < w; x++) {
+          const addX = Math.min(w - 1, x + r);
+          const remX = Math.max(0, x - r - 1);
+          sum += data[(y * w + addX) * ch + c] - data[(y * w + remX) * ch + c];
+          temp[(y * w + x) * ch + c] = sum / diam;
+        }
+      }
+    }
+
+    // Vertical pass: temp → out
+    for (let x = 0; x < w; x++) {
+      for (let c = 0; c < ch; c++) {
+        let sum = 0;
+        for (let dy = -r; dy <= r; dy++) {
+          const y = Math.max(0, Math.min(h - 1, dy));
+          sum += temp[(y * w + x) * ch + c];
+        }
+        out[(0 * w + x) * ch + c] = sum / diam;
+        for (let y = 1; y < h; y++) {
+          const addY = Math.min(h - 1, y + r);
+          const remY = Math.max(0, y - r - 1);
+          sum += temp[(addY * w + x) * ch + c] - temp[(remY * w + x) * ch + c];
+          out[(y * w + x) * ch + c] = sum / diam;
+        }
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Downsample image by 2x (average 2x2 blocks).
+   * @param {Float32Array} data - w*h*ch
+   * @returns {{ data: Float32Array, w: number, h: number }}
+   */
+  _downsample2x(data, w, h, ch) {
+    const nw = Math.floor(w / 2), nh = Math.floor(h / 2);
+    const out = new Float32Array(nw * nh * ch);
+    for (let y = 0; y < nh; y++) {
+      for (let x = 0; x < nw; x++) {
+        for (let c = 0; c < ch; c++) {
+          const v =
+            data[((y * 2) * w + x * 2) * ch + c] +
+            data[((y * 2) * w + x * 2 + 1) * ch + c] +
+            data[((y * 2 + 1) * w + x * 2) * ch + c] +
+            data[((y * 2 + 1) * w + x * 2 + 1) * ch + c];
+          out[(y * nw + x) * ch + c] = v / 4;
+        }
+      }
+    }
+    return { data: out, w: nw, h: nh };
+  }
+
+  /**
+   * Upsample image by 2x (bilinear).
+   * @param {Float32Array} data - w*h*ch
+   * @returns {{ data: Float32Array, w: number, h: number }}
+   */
+  _upsample2x(data, w, h, ch, targetW, targetH) {
+    const out = new Float32Array(targetW * targetH * ch);
+    for (let y = 0; y < targetH; y++) {
+      for (let x = 0; x < targetW; x++) {
+        const srcX = (x + 0.5) / 2 - 0.5;
+        const srcY = (y + 0.5) / 2 - 0.5;
+        const x0 = Math.max(0, Math.min(w - 1, Math.floor(srcX)));
+        const y0 = Math.max(0, Math.min(h - 1, Math.floor(srcY)));
+        const x1 = Math.min(w - 1, x0 + 1);
+        const y1 = Math.min(h - 1, y0 + 1);
+        const fx = srcX - x0, fy = srcY - y0;
+        for (let c = 0; c < ch; c++) {
+          const v00 = data[(y0 * w + x0) * ch + c];
+          const v10 = data[(y0 * w + x1) * ch + c];
+          const v01 = data[(y1 * w + x0) * ch + c];
+          const v11 = data[(y1 * w + x1) * ch + c];
+          out[(y * targetW + x) * ch + c] =
+            (1 - fy) * ((1 - fx) * v00 + fx * v10) +
+            fy * ((1 - fx) * v01 + fx * v11);
+        }
+      }
+    }
+    return { data: out, w: targetW, h: targetH };
+  }
+
+  /**
+   * Mask-normalized Laplacian pyramid blend of photo texture and albedo.
+   *
+   * Uses mask-normalized convolution: at each pyramid level,
+   * blur(img * mask) / blur(mask) — ensures only valid skin pixels
+   * contribute, preventing background wall/hair bleed.
+   *
+   * @param {ImageData} photoData  - Rasterized photo texture (with alpha = coverage mask)
+   * @param {ImageData} albedoData - Color-corrected FLAME albedo (full coverage)
+   * @param {number} size - Texture dimension (2048)
+   * @param {number} levels - Pyramid levels (5)
+   * @returns {ImageData} blended result
+   */
+  _laplacianBlend(photoData, albedoData, size, levels = 5) {
+    const ch = 3; // Work in RGB only
+    const N = size * size;
+
+    // Extract RGB float arrays and mask from alpha
+    const photoRGB = new Float32Array(N * ch);
+    const albedoRGB = new Float32Array(N * ch);
+    const mask = new Float32Array(N); // 0..1 blend weight
+
+    const pd = photoData.data;
+    const ad = albedoData.data;
+    for (let i = 0; i < N; i++) {
+      const alpha = pd[i * 4 + 3] / 255; // photo coverage
+      mask[i] = alpha;
+      photoRGB[i * 3]     = pd[i * 4];
+      photoRGB[i * 3 + 1] = pd[i * 4 + 1];
+      photoRGB[i * 3 + 2] = pd[i * 4 + 2];
+      albedoRGB[i * 3]     = ad[i * 4];
+      albedoRGB[i * 3 + 1] = ad[i * 4 + 1];
+      albedoRGB[i * 3 + 2] = ad[i * 4 + 2];
+    }
+
+    // --- Mask-normalized photo: fill unmapped regions with normalized blur ---
+    // This prevents background bleed: blur(photo * mask) / blur(mask)
+    const maskedPhoto = new Float32Array(N * ch);
+    for (let i = 0; i < N; i++) {
+      maskedPhoto[i * 3]     = photoRGB[i * 3] * mask[i];
+      maskedPhoto[i * 3 + 1] = photoRGB[i * 3 + 1] * mask[i];
+      maskedPhoto[i * 3 + 2] = photoRGB[i * 3 + 2] * mask[i];
+    }
+    const blurredMasked = this._gaussBlur(maskedPhoto, size, size, ch, 8);
+    const blurredMask = this._gaussBlur(mask, size, size, 1, 8);
+    // Normalize: fill unmapped photo pixels with mask-normalized values
+    const photoFilled = new Float32Array(photoRGB);
+    for (let i = 0; i < N; i++) {
+      if (mask[i] < 0.5 && blurredMask[i] > 0.01) {
+        photoFilled[i * 3]     = blurredMasked[i * 3]     / blurredMask[i];
+        photoFilled[i * 3 + 1] = blurredMasked[i * 3 + 1] / blurredMask[i];
+        photoFilled[i * 3 + 2] = blurredMasked[i * 3 + 2] / blurredMask[i];
+      }
+    }
+
+    // --- Build Gaussian pyramids ---
+    const photoGauss = [{ data: photoFilled, w: size, h: size }];
+    const albedoGauss = [{ data: albedoRGB, w: size, h: size }];
+    const maskGauss = [{ data: mask, w: size, h: size }];
+
+    for (let l = 1; l <= levels; l++) {
+      const prev = photoGauss[l - 1];
+      const blurR = 2; // blur before downsample
+      const pBlur = this._gaussBlur(prev.data, prev.w, prev.h, ch, blurR);
+      photoGauss.push(this._downsample2x(pBlur, prev.w, prev.h, ch));
+
+      const aprev = albedoGauss[l - 1];
+      const aBlur = this._gaussBlur(aprev.data, aprev.w, aprev.h, ch, blurR);
+      albedoGauss.push(this._downsample2x(aBlur, aprev.w, aprev.h, ch));
+
+      const mprev = maskGauss[l - 1];
+      const mBlur = this._gaussBlur(mprev.data, mprev.w, mprev.h, 1, blurR);
+      maskGauss.push(this._downsample2x(mBlur, mprev.w, mprev.h, 1));
+    }
+
+    // --- Build Laplacian pyramids (L[l] = G[l] - upsample(G[l+1])) ---
+    const photoLap = [];
+    const albedoLap = [];
+    for (let l = 0; l < levels; l++) {
+      const pCur = photoGauss[l];
+      const pNext = photoGauss[l + 1];
+      const pUp = this._upsample2x(pNext.data, pNext.w, pNext.h, ch, pCur.w, pCur.h);
+
+      const lapP = new Float32Array(pCur.data.length);
+      for (let i = 0; i < lapP.length; i++) lapP[i] = pCur.data[i] - pUp.data[i];
+      photoLap.push({ data: lapP, w: pCur.w, h: pCur.h });
+
+      const aCur = albedoGauss[l];
+      const aNext = albedoGauss[l + 1];
+      const aUp = this._upsample2x(aNext.data, aNext.w, aNext.h, ch, aCur.w, aCur.h);
+
+      const lapA = new Float32Array(aCur.data.length);
+      for (let i = 0; i < lapA.length; i++) lapA[i] = aCur.data[i] - aUp.data[i];
+      albedoLap.push({ data: lapA, w: aCur.w, h: aCur.h });
+    }
+
+    // --- Blend each Laplacian level using mask at that level ---
+    const blendedLap = [];
+    for (let l = 0; l < levels; l++) {
+      const pL = photoLap[l];
+      const aL = albedoLap[l];
+      const mL = maskGauss[l];
+      const blended = new Float32Array(pL.data.length);
+      const pw = pL.w;
+      for (let y = 0; y < pL.h; y++) {
+        for (let x = 0; x < pw; x++) {
+          const mi = mL.data[y * pw + x]; // mask at this level
+          const t = Math.max(0, Math.min(1, mi)); // clamp
+          for (let c = 0; c < ch; c++) {
+            const idx = (y * pw + x) * ch + c;
+            blended[idx] = t * pL.data[idx] + (1 - t) * aL.data[idx];
+          }
+        }
+      }
+      blendedLap.push({ data: blended, w: pw, h: pL.h });
+    }
+
+    // Blend coarsest Gaussian level too
+    const pCoarse = photoGauss[levels];
+    const aCoarse = albedoGauss[levels];
+    const mCoarse = maskGauss[levels];
+    const blendedCoarse = new Float32Array(pCoarse.data.length);
+    for (let y = 0; y < pCoarse.h; y++) {
+      for (let x = 0; x < pCoarse.w; x++) {
+        const t = Math.max(0, Math.min(1, mCoarse.data[y * pCoarse.w + x]));
+        for (let c = 0; c < ch; c++) {
+          const idx = (y * pCoarse.w + x) * ch + c;
+          blendedCoarse[idx] = t * pCoarse.data[idx] + (1 - t) * aCoarse.data[idx];
+        }
+      }
+    }
+
+    // --- Reconstruct: sum Laplacian levels bottom-up ---
+    let current = { data: blendedCoarse, w: pCoarse.w, h: pCoarse.h };
+    for (let l = levels - 1; l >= 0; l--) {
+      const bL = blendedLap[l];
+      const up = this._upsample2x(current.data, current.w, current.h, ch, bL.w, bL.h);
+      const result = new Float32Array(bL.data.length);
+      for (let i = 0; i < result.length; i++) result[i] = up.data[i] + bL.data[i];
+      current = { data: result, w: bL.w, h: bL.h };
+    }
+
+    // --- Write back to ImageData ---
+    const outData = new ImageData(size, size);
+    const od = outData.data;
+    for (let i = 0; i < N; i++) {
+      od[i * 4]     = Math.max(0, Math.min(255, Math.round(current.data[i * 3])));
+      od[i * 4 + 1] = Math.max(0, Math.min(255, Math.round(current.data[i * 3 + 1])));
+      od[i * 4 + 2] = Math.max(0, Math.min(255, Math.round(current.data[i * 3 + 2])));
+      od[i * 4 + 3] = 255; // fully opaque final result
+    }
+
+    console.log(`Laplacian blend: ${levels} levels, mask-normalized, ${size}x${size}`);
+    return outData;
+  }
+
+  /**
+   * Prepare the full-coverage FLAME albedo layer for Laplacian blending.
+   * Returns an ImageData with color-corrected albedo at every pixel.
+   */
+  _prepareAlbedoLayer(photoImageData, meshGen, size) {
+    const albedoData = new ImageData(size, size);
+    const ad = albedoData.data;
+    const pd = photoImageData.data;
+
+    // Get FLAME albedo data
+    const albedo = meshGen.albedoDiffuseData;
+    if (!albedo) {
+      // No albedo → fill with average photo skin color
+      let rSum = 0, gSum = 0, bSum = 0, count = 0;
+      for (let i = 0; i < size * size; i++) {
+        if (pd[i * 4 + 3] > 200) {
+          rSum += pd[i * 4]; gSum += pd[i * 4 + 1]; bSum += pd[i * 4 + 2];
+          count++;
+        }
+      }
+      const avgR = count > 0 ? Math.round(rSum / count) : 180;
+      const avgG = count > 0 ? Math.round(gSum / count) : 150;
+      const avgB = count > 0 ? Math.round(bSum / count) : 130;
+      for (let i = 0; i < size * size; i++) {
+        ad[i * 4] = avgR; ad[i * 4 + 1] = avgG; ad[i * 4 + 2] = avgB; ad[i * 4 + 3] = 255;
+      }
+      return albedoData;
+    }
+
+    const albedoRes = meshGen.albedoResolution || 512;
+
+    // Compute color correction ratio (photo avg / albedo avg)
+    let prSum = 0, pgSum = 0, pbSum = 0, arSum = 0, agSum = 0, abSum = 0, sampleCount = 0;
+    for (let i = 0; i < size * size; i++) {
+      if (pd[i * 4 + 3] < 200) continue;
+      const u = (i % size) / size;
+      const v = Math.floor(i / size) / size;
+      const ax = Math.min(albedoRes - 1, Math.floor(u * albedoRes));
+      const ay = Math.min(albedoRes - 1, Math.floor(v * albedoRes));
+      const ai = (ay * albedoRes + ax) * 3;
+      prSum += pd[i * 4]; pgSum += pd[i * 4 + 1]; pbSum += pd[i * 4 + 2];
+      arSum += albedo[ai]; agSum += albedo[ai + 1]; abSum += albedo[ai + 2];
+      sampleCount++;
+    }
+
+    const crR = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, prSum / (arSum + 1))) : 1;
+    const crG = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pgSum / (agSum + 1))) : 1;
+    const crB = sampleCount > 0 ? Math.max(0.3, Math.min(3.0, pbSum / (abSum + 1))) : 1;
+
+    // Fill every pixel with color-corrected albedo
+    for (let i = 0; i < size * size; i++) {
+      const u = (i % size) / size;
+      const v = Math.floor(i / size) / size;
+      const ax = Math.min(albedoRes - 1, Math.floor(u * albedoRes));
+      const ay = Math.min(albedoRes - 1, Math.floor(v * albedoRes));
+      const ai = (ay * albedoRes + ax) * 3;
+      ad[i * 4]     = Math.min(255, Math.round(albedo[ai] * crR));
+      ad[i * 4 + 1] = Math.min(255, Math.round(albedo[ai + 1] * crG));
+      ad[i * 4 + 2] = Math.min(255, Math.round(albedo[ai + 2] * crB));
+      ad[i * 4 + 3] = 255;
+    }
+
+    return albedoData;
+  }
+
+  // -----------------------------------------------------------------------
   // Thin-Plate Spline (TPS) interpolation
   // -----------------------------------------------------------------------
 
@@ -1759,11 +2388,14 @@ export class PhotoUploader {
    * Rasterise all FLAME UV faces, sampling the source photo via
    * TPS-interpolated per-vertex image coordinates.
    */
-  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null) {
+  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null) {
     const out = outImageData.data;
     const nFaces = uvFaces.length / 3;
 
     for (let f = 0; f < nFaces; f++) {
+      // Skip inner mouth / excluded faces
+      if (excludedFaces && excludedFaces.has(f)) continue;
+
       // Optional backface culling via visibility mask
       const vis = faceVisibility ? faceVisibility[f] : 1.0;
       if (vis <= 0) continue;
