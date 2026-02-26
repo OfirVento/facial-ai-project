@@ -1714,13 +1714,12 @@ export class PhotoUploader {
    * @returns {Uint8Array} srcW*srcH binary mask (1 = inside face, 0 = outside)
    */
   _buildFaceBoundaryMask(landmarks, srcW, srcH) {
-    // MediaPipe face oval + extended forehead/temple landmarks for better scalp coverage
+    // MediaPipe standard face oval contour (ordered: forehead → jaw → forehead)
+    // NOTE: only use BOUNDARY landmarks — interior points break scanline polygon fill
     const FACE_OVAL = [
       10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397,
       365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58,
-      132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
-      // Additional forehead/temple landmarks for scalp coverage
-      151, 9, 8, 168
+      132, 93, 234, 127, 162, 21, 54, 103, 67, 109
     ];
 
     // Extract polygon vertices in pixel coordinates
@@ -2926,8 +2925,9 @@ export class PhotoUploader {
     const nFaces = uvFaces.length / 3;
 
     // --- Depth buffer: closest surface wins (prevents overlapping face bleed) ---
+    // In FLAME coords, closer-to-camera = larger rotated Z (nose > ears)
     const depthBuffer = new Float32Array(size * size);
-    depthBuffer.fill(Infinity);
+    depthBuffer.fill(-Infinity);
     let invertedSkipped = 0;
     let depthRejected = 0;
 
@@ -2952,9 +2952,11 @@ export class PhotoUploader {
       const ix1 = uvImgCoords[vi1 * 2], iy1 = uvImgCoords[vi1 * 2 + 1];
       const ix2 = uvImgCoords[vi2 * 2], iy2 = uvImgCoords[vi2 * 2 + 1];
 
-      // --- Triangle inversion check: skip if projected 2D triangle has flipped ---
+      // --- Triangle inversion check: skip degenerate (near-zero area) projected triangles ---
+      // Note: with anisotropic weak-perspective, sy is often negative (Y-flip),
+      // so signed area sign depends on sign(sx*sy). We only skip truly degenerate triangles.
       const signedArea2D = (ix1 - ix0) * (iy2 - iy0) - (ix2 - ix0) * (iy1 - iy0);
-      if (signedArea2D < 0) {
+      if (Math.abs(signedArea2D) < 1e-12) {
         invertedSkipped++;
         continue;
       }
@@ -2990,11 +2992,11 @@ export class PhotoUploader {
 
           if (w0 < -0.001 || w1 < -0.001 || w2 < -0.001) continue;
 
-          // --- Depth test: only write if this fragment is closer ---
+          // --- Depth test: only write if this fragment is closer (larger zr = closer) ---
           if (uvDepths) {
             const pixelDepth = w0 * d0 + w1 * d1 + w2 * d2;
             const dbIdx = py * size + px;
-            if (pixelDepth >= depthBuffer[dbIdx]) {
+            if (pixelDepth <= depthBuffer[dbIdx]) {
               depthRejected++;
               continue;
             }
