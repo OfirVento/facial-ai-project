@@ -240,27 +240,29 @@ export class FaceRenderer {
    * The photo already contains its own shading information.
    */
   _setPhotoLighting() {
-    // Reduce directional lights to minimize double-shadowing
+    // Photo texture already contains real-world shading.
+    // Use nearly flat lighting to avoid double-shadowing.
+    // Only add minimal directional cues for 3D depth perception.
     if (this.lights.key) {
-      this.lights.key.intensity = 0.5;             // reduced — photo already has its own shading
+      this.lights.key.intensity = 0.25;            // very subtle directional cue
       this.lights.key.color.set(0xffffff);         // neutral white
       this.lights.key.castShadow = false;          // no shadow casting on photo texture
     }
     if (this.lights.fill) {
-      this.lights.fill.intensity = 0.5;            // balanced with key for even illumination
+      this.lights.fill.intensity = 0.25;           // balanced with key
       this.lights.fill.color.set(0xffffff);        // neutral
     }
     if (this.lights.rim) {
-      this.lights.rim.intensity = 0.15;            // subtle rim only
+      this.lights.rim.intensity = 0.1;             // barely visible rim
     }
     if (this.lights.ambient) {
-      this.lights.ambient.intensity = 0.9;         // high ambient — let photo texture dominate
+      this.lights.ambient.intensity = 1.05;        // dominant ambient — photo IS the shading
       this.lights.ambient.color.set(0xffffff);     // neutral
     }
     if (this.lights.rectArea) {
-      this.lights.rectArea.intensity = 0.4;        // reduced area light
+      this.lights.rectArea.intensity = 0.15;       // minimal area light
     }
-    console.log('FaceRenderer: Switched to photo-neutral lighting');
+    console.log('FaceRenderer: Switched to photo-flat lighting');
   }
 
   // -- PBR skin material --------------------------------------------------
@@ -403,7 +405,7 @@ export class FaceRenderer {
           this.faceMaterial.clearcoat = 0.0;         // no clearcoat — prevents wet plastic look
           this.faceMaterial.transmission = 0;        // no subsurface transmission
           this.faceMaterial.thickness = 0;
-          this.faceMaterial.roughness = 0.75;        // more matte — photo texture IS the shading
+          this.faceMaterial.roughness = 0.85;        // very matte — photo texture IS the shading, minimize specular
         }
         // Switch to neutral lighting to avoid double-shadowing
         this._setPhotoLighting();

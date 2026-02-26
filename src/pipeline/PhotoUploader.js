@@ -2224,7 +2224,7 @@ export class PhotoUploader {
     // This normalizes each pixel to remove directional lighting while preserving
     // the overall brightness level (avgLum).
     // Use a mild strength factor to avoid over-flattening.
-    const strength = 0.35; // 0=no delighting, 1=full delighting (keep mild to preserve natural look)
+    const strength = 0.2; // 0=no delighting, 1=full delighting (very mild — 3D lighting is nearly flat)
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] === 0) continue;
 
@@ -2242,6 +2242,31 @@ export class PhotoUploader {
     }
 
     console.log(`PhotoUploader DENSE: Delighting applied (avgLum=${avgLum.toFixed(1)}, radius=${blurRadius}, strength=${strength})`);
+
+    // --- 4. Brightness normalization: ensure texture isn't too dark/bright ---
+    // Target luminance ~140 is a good midpoint for natural skin under flat lighting
+    const TARGET_LUM = 140;
+    let postLumSum = 0, postCount = 0;
+    for (let i = 0; i < total; i++) {
+      if (data[i * 4 + 3] === 0) continue;
+      postLumSum += 0.2126 * data[i * 4] + 0.7152 * data[i * 4 + 1] + 0.0722 * data[i * 4 + 2];
+      postCount++;
+    }
+    if (postCount > 100) {
+      const postAvg = postLumSum / postCount;
+      const brightnessFactor = Math.min(1.4, Math.max(0.8, TARGET_LUM / postAvg));
+      if (Math.abs(brightnessFactor - 1.0) > 0.05) {
+        for (let i = 0; i < total; i++) {
+          if (data[i * 4 + 3] === 0) continue;
+          data[i * 4]     = Math.min(255, Math.round(data[i * 4] * brightnessFactor));
+          data[i * 4 + 1] = Math.min(255, Math.round(data[i * 4 + 1] * brightnessFactor));
+          data[i * 4 + 2] = Math.min(255, Math.round(data[i * 4 + 2] * brightnessFactor));
+        }
+        console.log(`PhotoUploader DENSE: Brightness normalized: avgLum ${postAvg.toFixed(1)} → ${(postAvg * brightnessFactor).toFixed(1)} (factor=${brightnessFactor.toFixed(3)})`);
+      } else {
+        console.log(`PhotoUploader DENSE: Brightness OK: avgLum=${postAvg.toFixed(1)}, no correction needed`);
+      }
+    }
   }
 
   /**
