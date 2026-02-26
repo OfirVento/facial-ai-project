@@ -431,20 +431,38 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         const normalMap = await this.photoUploader.generateNormalMapFromPhoto();
 
         // Apply photo texture to existing mesh
+        // flipY=false because the rasterizer writes UV V directly to canvas Y
+        // (row 0 = V=0 = chin), matching WebGL's native texture layout
         if (this.renderer) {
-          await this.renderer.loadTexture(texture.dataUrl, 'albedo');
+          await this.renderer.loadTexture(texture.dataUrl, 'albedo', { flipY: false });
           if (normalMap) {
-            await this.renderer.loadTexture(normalMap.dataUrl, 'normal');
+            await this.renderer.loadTexture(normalMap.dataUrl, 'normal', { flipY: false });
           }
         }
 
-        this._addMessage('system', 'Photo texture projected onto 3D model. You can now modify the face using chat or sliders.');
+        // ===== DIAGNOSTIC: Show debug panel with overlays =====
+        this._showTextureDebugPanel(this.photoUploader);
+
+        this._addMessage('system', 'Photo texture projected onto 3D model. Debug panel shown below viewport.');
         btn.textContent = '✓ Generated';
       } catch (err) {
         console.error(err);
         this._addMessage('system', `Error: ${err.message}`);
         btn.textContent = 'Generate 3D Model';
         btn.disabled = false;
+      }
+    });
+
+    // ===== DIAGNOSTIC: UV Checkerboard test button =====
+    document.getElementById('generate-btn')?.insertAdjacentHTML('afterend',
+      ' <button id="uv-checker-btn" style="margin-left:6px;padding:4px 8px;font-size:11px;background:#553;color:#ff0;border:1px solid #882;border-radius:4px;cursor:pointer" title="Test 3: Load UV checkerboard to verify orientation">UV Check</button>'
+    );
+    document.getElementById('uv-checker-btn')?.addEventListener('click', async () => {
+      const { PhotoUploader } = await import('./pipeline/PhotoUploader.js');
+      const checkerUrl = PhotoUploader.generateUVCheckerboard();
+      if (this.renderer) {
+        await this.renderer.loadTexture(checkerUrl, 'albedo', { flipY: false });
+        this._addMessage('system', 'UV Checkerboard loaded. Check: TL=chin-right, TR=chin-left, center=nose. If wrong → flipY/axis bug.');
       }
     });
 
@@ -763,6 +781,49 @@ You can now modify specific regions — try saying "make my nose thinner" or use
       this._addMessage('system', 'Something went wrong. Please try again.');
       console.error(err);
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // DIAGNOSTIC: Debug panel for texture projection
+  // -----------------------------------------------------------------------
+
+  _showTextureDebugPanel(uploader) {
+    // Remove old panel if present
+    document.getElementById('texture-debug-panel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'texture-debug-panel';
+    panel.style.cssText = `
+      position:fixed; bottom:0; left:0; right:0; z-index:10000;
+      background:#111; border-top:2px solid #f80; padding:10px;
+      display:flex; gap:12px; overflow-x:auto; max-height:45vh;
+    `;
+
+    const makeSection = (title, dataUrl) => {
+      if (!dataUrl) return '';
+      return `<div style="flex-shrink:0;text-align:center">
+        <div style="color:#ff0;font-size:11px;margin-bottom:4px;font-family:monospace">${title}</div>
+        <img src="${dataUrl}" style="max-height:35vh;border:1px solid #555;image-rendering:pixelated" />
+      </div>`;
+    };
+
+    let html = '';
+    html += makeSection('TEST 1a: Photo + Landmarks', uploader._debugPhotoLandmarks);
+    html += makeSection('TEST 1b: UV Atlas + Points', uploader._debugUVLandmarks);
+    html += makeSection('TEST 2a: Texture (pre-fill)', uploader._debugPreFillTexture);
+    html += makeSection('TEST 2b: Texture (final)', uploader._debugFinalTexture);
+
+    // Close button
+    html += `<div style="flex-shrink:0;display:flex;align-items:center">
+      <button onclick="this.closest('#texture-debug-panel').remove()"
+        style="padding:8px 16px;background:#800;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px">
+        ✕ Close
+      </button>
+    </div>`;
+
+    panel.innerHTML = html;
+    document.body.appendChild(panel);
+    console.log('PhotoUploader DIAG: Debug panel displayed');
   }
 
   _addMessage(role, text) {

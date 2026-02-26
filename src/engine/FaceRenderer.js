@@ -234,6 +234,35 @@ export class FaceRenderer {
     this.lights.rectArea = rectArea;
   }
 
+  /**
+   * Switch to neutral even lighting for photo-textured models.
+   * Removes directional bias so the delighted texture shows faithfully.
+   * The photo already contains its own shading information.
+   */
+  _setPhotoLighting() {
+    // Reduce directional lights to minimize double-shadowing
+    if (this.lights.key) {
+      this.lights.key.intensity = 0.8;           // was 2.0
+      this.lights.key.color.set(0xffffff);         // neutral white (was warm)
+      this.lights.key.castShadow = false;          // no shadow casting on photo texture
+    }
+    if (this.lights.fill) {
+      this.lights.fill.intensity = 0.6;            // was 0.7
+      this.lights.fill.color.set(0xffffff);         // neutral (was cool blue)
+    }
+    if (this.lights.rim) {
+      this.lights.rim.intensity = 0.3;             // was 0.5
+    }
+    if (this.lights.ambient) {
+      this.lights.ambient.intensity = 0.7;         // was 0.4 — boost ambient for even lighting
+      this.lights.ambient.color.set(0xffffff);      // neutral (was purple)
+    }
+    if (this.lights.rectArea) {
+      this.lights.rectArea.intensity = 0.6;        // was 1.2
+    }
+    console.log('FaceRenderer: Switched to photo-neutral lighting');
+  }
+
   // -- PBR skin material --------------------------------------------------
 
   _initMaterial() {
@@ -354,18 +383,30 @@ export class FaceRenderer {
    * Load a texture and assign it to the face material.
    * @param {string} url - Texture image URL.
    * @param {'albedo'|'normal'|'roughness'} type
+   * @param {{ flipY?: boolean }} [options]
    * @returns {Promise<THREE.Texture>}
    */
-  async loadTexture(url, type = 'albedo') {
+  async loadTexture(url, type = 'albedo', options = {}) {
     const loader = new THREE.TextureLoader();
     const texture = await loader.loadAsync(url);
     texture.colorSpace = type === 'albedo' ? THREE.SRGBColorSpace : THREE.LinearSRGBColorSpace;
-    texture.flipY = true;
+    texture.flipY = options.flipY !== undefined ? options.flipY : true;
     texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
 
     switch (type) {
       case 'albedo':
         this.faceMaterial.map = texture;
+        // When loading a photo-based albedo, optimize material for color fidelity
+        this.faceMaterial.color.set(0xffffff);
+        if (this.faceMaterial.isMeshPhysicalMaterial) {
+          this.faceMaterial.sheen = 0.02;          // minimize sheen overlay
+          this.faceMaterial.clearcoat = 0.01;       // near-zero clearcoat
+          this.faceMaterial.transmission = 0;        // no subsurface transmission
+          this.faceMaterial.thickness = 0;
+          this.faceMaterial.roughness = 0.65;        // slightly matte for skin
+        }
+        // Switch to neutral lighting to avoid double-shadowing
+        this._setPhotoLighting();
         break;
       case 'normal':
         this.faceMaterial.normalMap = texture;
