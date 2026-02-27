@@ -1625,12 +1625,13 @@ export class PhotoUploader {
       const cosAngle = nLen > 1e-10 ? dot / nLen : 0;
 
       // Smooth visibility: fully visible when facing camera, kill grazing angles
-      if (cosAngle > 0.3) {
+      // Relaxed thresholds (Phase 8): 0.25/0.05 (was 0.3/0.1) for better ear coverage
+      if (cosAngle > 0.25) {
         visibility[f] = 1.0;
         visibleCount++;
-      } else if (cosAngle > 0.1) {
-        // Narrow fade zone — only allow near-front faces
-        visibility[f] = (cosAngle - 0.1) / 0.2;
+      } else if (cosAngle > 0.05) {
+        // Fade zone — gradual falloff for near-silhouette faces
+        visibility[f] = (cosAngle - 0.05) / 0.20;
         visibleCount++;
       } else {
         // Grazing or back-facing — kill completely
@@ -2387,16 +2388,22 @@ export class PhotoUploader {
     // This normalizes each pixel to remove directional lighting while preserving
     // the overall brightness level (avgLum).
     // Use a mild strength factor to avoid over-flattening.
-    const strength = 0.2; // 0=no delighting, 1=full delighting (very mild — 3D lighting is nearly flat)
+    // Adaptive: darker pixels get less correction to preserve natural under-eye/shadow tones.
+    const BASE_STRENGTH = 0.2; // 0=no delighting, 1=full delighting
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] === 0) continue;
 
       const shade = blurred[i];
       if (shade < 5) continue; // Avoid division by near-zero
 
+      // Adaptive strength: scale by local luminance — dark regions get less correction
+      // Under-eye areas (~lum 0.3) get ~60% of base strength; bright cheeks (~lum 0.7) get full
+      const localLum = lum[i] / 255;
+      const strength = BASE_STRENGTH * Math.min(1.0, localLum / 0.5);
+
       // Correction factor: how much to brighten/darken to remove shading
       const correction = avgLum / shade;
-      // Blend between original and delighted based on strength
+      // Blend between original and delighted based on adaptive strength
       const factor = 1.0 + strength * (correction - 1.0);
 
       data[i * 4]     = Math.min(255, Math.max(0, Math.round(data[i * 4] * factor)));
@@ -2467,8 +2474,8 @@ export class PhotoUploader {
     const factorG = targetAvg.g / Math.max(1, currentAvg.g);
     const factorB = targetAvg.b / Math.max(1, currentAvg.b);
 
-    // Clamp to ±15% to avoid extreme corrections
-    const clamp = (f) => Math.max(0.85, Math.min(1.15, f));
+    // Clamp to ±20% to allow fuller correction of processing-induced color shifts
+    const clamp = (f) => Math.max(0.80, Math.min(1.20, f));
     const fR = clamp(factorR), fG = clamp(factorG), fB = clamp(factorB);
 
     if (Math.abs(fR - 1) < 0.02 && Math.abs(fG - 1) < 0.02 && Math.abs(fB - 1) < 0.02) {
@@ -3058,13 +3065,14 @@ export class PhotoUploader {
     const albedoRes = meshGen.albedoResolution || 512;
 
     // Compute robust color correction using trimmed mean
-    // Sample from forehead/cheek regions only (avoid beard, nose shadows, etc.)
-    // Landmarks: 8 (nose bridge), 10 (forehead), 117 (right cheek), 346 (left cheek)
+    // Sample from forehead/cheek/chin/ear regions for comprehensive coverage.
+    // Landmarks: 8 (nose bridge), 10 (forehead), 117 (right cheek), 346 (left cheek),
+    //            152 (chin), 234 (left ear/tragus), 454 (right ear/tragus)
 
     // Build UV-space bounding boxes for sampling regions
     let sampleBoxes = null;
     if (landmarks && mapping) {
-      const SAMPLE_MP = [8, 10, 117, 346];
+      const SAMPLE_MP = [8, 10, 117, 346, 152, 234, 454];
       const uvCoords = meshGen.flameUVCoords;
       const uvFaces = meshGen.flameUVFaces;
       const mpIndices = mapping.landmark_indices;
