@@ -262,7 +262,18 @@ export class FaceRenderer {
     if (this.lights.rectArea) {
       this.lights.rectArea.intensity = 0.15;       // minimal area light
     }
-    console.log('FaceRenderer: Switched to photo-flat lighting');
+
+    // Disable ACES tone mapping for photo mode.
+    // The photo texture is already in sRGB gamut from the camera.
+    // ACES applies a nonlinear S-curve that double-compresses highlights and
+    // lifts shadows, flattening skin detail and creating a "waxy" appearance.
+    if (this.renderer) {
+      this._savedToneMapping = this.renderer.toneMapping;
+      this._savedToneMappingExposure = this.renderer.toneMappingExposure;
+      this.renderer.toneMapping = THREE.NoToneMapping;
+    }
+
+    console.log('FaceRenderer: Switched to photo-flat lighting (NoToneMapping)');
   }
 
   // -- PBR skin material --------------------------------------------------

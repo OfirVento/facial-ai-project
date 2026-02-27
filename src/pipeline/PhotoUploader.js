@@ -575,6 +575,10 @@ export class PhotoUploader {
       console.warn('PhotoUploader DENSE: No fitted camera provided — estimated independently (may diverge!)');
     }
     console.log(`PhotoUploader DENSE: camera sx=${cameraParams.sx.toFixed(4)}, sy=${cameraParams.sy.toFixed(4)}, tx=${cameraParams.tx.toFixed(4)}, ty=${cameraParams.ty.toFixed(4)}`);
+    // P3 verification: confirm bake camera is identical to fit camera
+    if (fittedCamera && cameraParams !== fittedCamera) {
+      console.error('CAMERA MISMATCH: projection using different camera object than fitting!');
+    }
 
     // --- 2. Project all position vertices to image space ---
     const { coords: projectedCoords, depths: vertexDepths } = this._projectAllVertices(meshGen, cameraParams);
@@ -633,9 +637,18 @@ export class PhotoUploader {
     // --- 5a. Apply UV mask: clear pixels outside valid UV footprint ---
     this._applyUVMask(outImageData, size, uvMask);
 
-    // --- 5a2. Edge dilation: expand mapped pixels into unmapped (alpha=0) regions ---
-    // Reduces hard seam between photo texture and albedo fill
-    this._dilateEdges(outImageData, size, 20);
+    // --- 5a2. Snapshot pre-dilation alpha for blur band ---
+    const preDilationAlpha = new Uint8Array(size * size);
+    for (let i = 0; i < size * size; i++) {
+      preDilationAlpha[i] = outImageData.data[i * 4 + 3] > 0 ? 1 : 0;
+    }
+
+    // --- 5a3. Edge dilation: expand mapped pixels into unmapped (alpha=0) regions ---
+    // Increased to 40 passes to compensate for eroded face boundary mask (P0).
+    this._dilateEdges(outImageData, size, 40);
+
+    // --- 5a4. Blur dilated band: smooth transition between original and dilated pixels ---
+    this._blurDilatedBand(outImageData, size, preDilationAlpha);
 
     // --- 5a3. Eye socket feathering: smooth boundary at eye sockets ---
     this._featherEyeSockets(outImageData, size, landmarks, mapping, uvCoords, uvFaces);
@@ -647,6 +660,24 @@ export class PhotoUploader {
       if (outImageData.data[i * 4 + 3] > 0) mappedPixels++;
     }
     console.log(`PhotoUploader DENSE: Mapped ${mappedPixels}/${totalPixels} pixels (${(mappedPixels / totalPixels * 100).toFixed(1)}%) after dilation`);
+
+    // --- Diagnostic: UV coverage mask (white=sampled, black=unmapped) ---
+    // Used to diagnose forehead seam: is it no-coverage or hard alpha edge?
+    const coverageCanvas = document.createElement('canvas');
+    coverageCanvas.width = size;
+    coverageCanvas.height = size;
+    const coverageCtx = coverageCanvas.getContext('2d');
+    const coverageData = coverageCtx.createImageData(size, size);
+    for (let i = 0; i < size * size; i++) {
+      const hasData = outImageData.data[i * 4 + 3] > 0 ? 255 : 0;
+      coverageData.data[i * 4] = hasData;
+      coverageData.data[i * 4 + 1] = hasData;
+      coverageData.data[i * 4 + 2] = hasData;
+      coverageData.data[i * 4 + 3] = 255;
+    }
+    coverageCtx.putImageData(coverageData, 0, 0);
+    this._debugCoverageMask = coverageCanvas.toDataURL('image/png');
+    console.log('PhotoUploader DIAG: UV coverage mask saved to _debugCoverageMask');
 
     // --- 5b-pre. Save source photo's per-channel averages before processing ---
     // Used to restore color balance after delight/smooth/brightness steps
@@ -667,7 +698,7 @@ export class PhotoUploader {
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    this._softenAlphaBoundary(outImageData, size, Math.max(10, Math.round(size / 80)));
+    this._softenAlphaBoundary(outImageData, size, Math.max(12, Math.round(size / 64)));
 
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
@@ -1785,15 +1816,28 @@ export class PhotoUploader {
       if (d > maxDist) maxDist = d;
     }
 
-    // Face-relative margin: 5% of face radius
-    const MARGIN_PX = Math.max(10, Math.round(maxDist * 0.05));
+    // Face-relative margin: ERODE inward by 3% of face radius
+    // Prevents sampling hair/background pixels near the face boundary.
+    // Paired with increased dilation + blur band to fill the resulting gap smoothly.
+    const MARGIN_PX = Math.max(8, Math.round(maxDist * 0.03));
     for (let i = 0; i < polyX.length; i++) {
       const dx = polyX[i] - cx;
       const dy = polyY[i] - cy;
       const len = Math.sqrt(dx * dx + dy * dy);
       if (len > 0.01) {
-        polyX[i] += (dx / len) * MARGIN_PX;
-        polyY[i] += (dy / len) * MARGIN_PX;
+        polyX[i] -= (dx / len) * MARGIN_PX;  // shrink inward (was += outward)
+        polyY[i] -= (dy / len) * MARGIN_PX;
+      }
+    }
+
+    // Extend forehead landmarks upward to prevent "cap/helmet line" seam.
+    // Vertices above the centroid by >30% of face radius get pushed up by 6% of radius.
+    // This keeps jaw/cheek erosion intact while extending scalp coverage.
+    const FOREHEAD_EXTEND = Math.round(maxDist * 0.06);
+    const FOREHEAD_THRESHOLD = cy - maxDist * 0.30; // above this Y = forehead region
+    for (let i = 0; i < polyX.length; i++) {
+      if (polyY[i] < FOREHEAD_THRESHOLD) {
+        polyY[i] -= FOREHEAD_EXTEND; // push upward (Y decreases upward in image space)
       }
     }
 
@@ -1986,6 +2030,97 @@ export class PhotoUploader {
     if (totalDilated > 0) {
       console.log(`PhotoUploader DENSE: Edge dilation filled ${totalDilated} pixels over ${iterations} passes`);
     }
+  }
+
+  /**
+   * Smooth the transition between original photo-sampled pixels and dilated fill pixels.
+   * Identifies the "band" where dilation occurred and applies a localized box blur
+   * to prevent banding or abrupt tonal shifts at the boundary.
+   * @param {ImageData} imageData - texture image data (modified in place)
+   * @param {number} size - texture width/height
+   * @param {Uint8Array} preDilationAlpha - snapshot of which pixels had alpha>0 before dilation
+   */
+  _blurDilatedBand(imageData, size, preDilationAlpha) {
+    const data = imageData.data;
+    const N = size * size;
+    const BLUR_R = Math.max(3, Math.round(size / 350)); // ~6px at 2048
+
+    // Build band mask: pixels that were filled by dilation (alpha=0 before, >0 after)
+    // Also include a border of original-coverage pixels within BLUR_R of the band
+    const bandMask = new Uint8Array(N); // 0=skip, 1=in band
+    for (let i = 0; i < N; i++) {
+      if (data[i * 4 + 3] > 0 && !preDilationAlpha[i]) bandMask[i] = 1;
+    }
+
+    // Expand band mask inward into original coverage by BLUR_R pixels
+    // so the blur covers both sides of the boundary
+    const expandedBand = new Uint8Array(bandMask);
+    for (let pass = 0; pass < BLUR_R; pass++) {
+      const toAdd = [];
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const idx = y * size + x;
+          if (expandedBand[idx]) continue; // already in band
+          if (data[idx * 4 + 3] === 0) continue; // unmapped
+          // Check if any 4-connected neighbor is in band
+          const offsets = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+          for (const [dx, dy] of offsets) {
+            const nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < size && ny >= 0 && ny < size) {
+              if (expandedBand[ny * size + nx]) { toAdd.push(idx); break; }
+            }
+          }
+        }
+      }
+      for (const idx of toAdd) expandedBand[idx] = 1;
+    }
+
+    // Count band pixels for diagnostics
+    let bandCount = 0;
+    for (let i = 0; i < N; i++) if (expandedBand[i]) bandCount++;
+    if (bandCount === 0) return;
+
+    // Apply box blur only to expanded band pixels
+    const blurredR = new Float32Array(N);
+    const blurredG = new Float32Array(N);
+    const blurredB = new Float32Array(N);
+
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        const idx = y * size + x;
+        if (!expandedBand[idx]) continue;
+
+        let rSum = 0, gSum = 0, bSum = 0, count = 0;
+        for (let dy = -BLUR_R; dy <= BLUR_R; dy++) {
+          for (let dx = -BLUR_R; dx <= BLUR_R; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+            const nIdx = (ny * size + nx) * 4;
+            if (data[nIdx + 3] === 0) continue; // skip unmapped
+            rSum += data[nIdx];
+            gSum += data[nIdx + 1];
+            bSum += data[nIdx + 2];
+            count++;
+          }
+        }
+        if (count > 0) {
+          blurredR[idx] = rSum / count;
+          blurredG[idx] = gSum / count;
+          blurredB[idx] = bSum / count;
+        }
+      }
+    }
+
+    // Write blurred values back
+    for (let i = 0; i < N; i++) {
+      if (!expandedBand[i]) continue;
+      const idx = i * 4;
+      data[idx] = Math.round(blurredR[i]);
+      data[idx + 1] = Math.round(blurredG[i]);
+      data[idx + 2] = Math.round(blurredB[i]);
+    }
+
+    console.log(`PhotoUploader DENSE: Blur band smoothed ${bandCount} pixels (radius=${BLUR_R})`);
   }
 
   /**
@@ -2361,7 +2496,7 @@ export class PhotoUploader {
   _smoothTextureColors(imageData, size) {
     const data = imageData.data;
     const N = size * size;
-    const BLEND = 0.25;  // 25% blend toward local average
+    const BLEND = 0.15;  // 15% blend toward local average (reduced to preserve skin detail)
     const RADIUS = Math.max(4, Math.round(size / 256)); // ~8px at 2048
 
     // Extract RGB for mapped pixels
