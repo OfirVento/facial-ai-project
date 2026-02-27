@@ -140,6 +140,11 @@ export class FaceRenderer {
 
     // Lights (stored for potential external tweaking)
     this.lights = {};
+
+    // Photo render mode (Phase 10)
+    this._photoRenderMode = 'emissive';   // 'emissive' | 'pbr' | 'hybrid'
+    this._photoExposure = 1.0;            // neutral default — hook for future UI
+    this._photoWhiteBalance = 0xffffff;   // neutral default — hook for future UI
   }
 
   // -----------------------------------------------------------------------
@@ -263,17 +268,85 @@ export class FaceRenderer {
       this.lights.rectArea.intensity = 0.15;       // minimal area light
     }
 
-    // Use LinearToneMapping for photo mode.
-    // ACES was too aggressive (waxy S-curve), NoToneMapping was too flat/dark.
-    // LinearToneMapping provides neutral brightness without the S-curve distortion.
-    if (this.renderer) {
-      this._savedToneMapping = this.renderer.toneMapping;
-      this._savedToneMappingExposure = this.renderer.toneMappingExposure;
-      this.renderer.toneMapping = THREE.LinearToneMapping;
-      this.renderer.toneMappingExposure = 1.0;
-    }
+    // Phase 10: Tone mapping is now handled per-material (material.toneMapped = false)
+    // No global renderer.toneMapping change needed — avoids scene-wide shader recompilation.
 
-    console.log('FaceRenderer: Switched to photo-flat lighting (NoToneMapping)');
+    console.log('FaceRenderer: Switched to photo-flat lighting');
+  }
+
+  // -- Photo render mode (Phase 10) ----------------------------------------
+
+  /**
+   * Switch material to emissive photo mode.
+   * Routes photo texture through the emissive path (bypasses BRDF 1/π darkening)
+   * while keeping the same MeshPhysicalMaterial instance.
+   */
+  _setPhotoMode(texture) {
+    const mat = this.faceMaterial;
+
+    // Route photo through emissive path → bypasses BRDF 1/π darkening
+    // Emissive formula: output = emissiveMap × emissive × emissiveIntensity
+    // With emissive=white, intensity=1.0: output = texture × 1.0 = exact photo
+    mat.emissiveMap = texture;
+    mat.emissive.set(this._photoWhiteBalance ?? 0xffffff);
+    mat.emissiveIntensity = this._photoExposure ?? 1.0;
+
+    // Kill diffuse path: color=black means diffuse contributes 0
+    // This eliminates the 1/π Lambertian normalization factor entirely
+    mat.map = null;
+    mat.color.set(0x000000);
+
+    // Disable PBR extras that could interfere
+    mat.sheen = 0.0;
+    mat.clearcoat = 0.0;
+    mat.transmission = 0;
+    mat.thickness = 0;
+    mat.roughness = 1.0;        // fully matte → near-zero specular (Phase 2: reduce for depth)
+    mat.metalness = 0.0;
+
+    // Per-material tone mapping bypass — no global renderer change
+    // Avoids scene-wide shader recompilation
+    mat.toneMapped = false;
+    mat.side = THREE.FrontSide;
+
+    mat.needsUpdate = true;
+
+    // Adjust lighting for photo mode
+    this._setPhotoLighting();
+
+    console.log('FaceRenderer: Photo mode (emissive path, toneMapped=false)');
+  }
+
+  /**
+   * Restore material to default PBR mode (for FLAME without photo).
+   */
+  _restoreDefaultMode() {
+    const mat = this.faceMaterial;
+
+    // Clear emissive
+    if (mat.emissiveMap) {
+      mat.emissiveMap.dispose();
+      mat.emissiveMap = null;
+    }
+    mat.emissive.set(0x000000);
+    mat.emissiveIntensity = 1.0;
+
+    // Restore PBR defaults
+    mat.map = null;
+    mat.color.set(DEFAULT_SKIN_COLOR);
+    mat.roughness = 0.55;
+    mat.metalness = 0.0;
+    mat.transmission = 0.05;
+    mat.thickness = 0.8;
+    mat.sheen = 0.25;
+    mat.clearcoat = 0.05;
+
+    mat.toneMapped = true;
+    mat.side = THREE.DoubleSide;
+
+    mat.needsUpdate = true;
+
+    console.log('FaceRenderer: Restored default PBR mode');
   }
 
   // -- PBR skin material --------------------------------------------------
@@ -408,18 +481,22 @@ export class FaceRenderer {
 
     switch (type) {
       case 'albedo':
-        this.faceMaterial.map = texture;
-        // When loading a photo-based albedo, optimize material for color fidelity
-        this.faceMaterial.color.set(0xffffff);
-        if (this.faceMaterial.isMeshPhysicalMaterial) {
-          this.faceMaterial.sheen = 0.0;            // no sheen — photo already has specularity
-          this.faceMaterial.clearcoat = 0.0;         // no clearcoat — prevents wet plastic look
-          this.faceMaterial.transmission = 0;        // no subsurface transmission
-          this.faceMaterial.thickness = 0;
-          this.faceMaterial.roughness = 0.85;        // very matte — photo texture IS the shading, minimize specular
+        if (this._photoRenderMode === 'emissive') {
+          // Phase 10: Route through emissive path for exact photo fidelity
+          this._setPhotoMode(texture);
+        } else {
+          // PBR fallback (original code path)
+          this.faceMaterial.map = texture;
+          this.faceMaterial.color.set(0xffffff);
+          if (this.faceMaterial.isMeshPhysicalMaterial) {
+            this.faceMaterial.sheen = 0.0;
+            this.faceMaterial.clearcoat = 0.0;
+            this.faceMaterial.transmission = 0;
+            this.faceMaterial.thickness = 0;
+            this.faceMaterial.roughness = 0.85;
+          }
+          this._setPhotoLighting();
         }
-        // Switch to neutral lighting to avoid double-shadowing
-        this._setPhotoLighting();
         break;
       case 'normal':
         this.faceMaterial.normalMap = texture;

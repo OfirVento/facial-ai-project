@@ -679,21 +679,14 @@ export class PhotoUploader {
     this._debugCoverageMask = coverageCanvas.toDataURL('image/png');
     console.log('PhotoUploader DIAG: UV coverage mask saved to _debugCoverageMask');
 
-    // --- 5b-pre. Save source photo's per-channel averages before processing ---
-    // Used to restore color balance after delight/smooth/brightness steps
-    const preAvg = this._computeChannelAverages(outImageData);
-
-    // --- 5b. Delight the texture: remove baked-in photo shading ---
-    // Divides out low-frequency luminance so 3D lighting can create proper shadows.
-    this._delightTexture(outImageData, size);
-
-    // --- 5b2. Color smoothing: reduce extreme local color variations ---
-    this._smoothTextureColors(outImageData, size);
-
-    // --- 5b3. Restore source photo's color balance ---
-    // Processing (delight, smooth, brightness) can shift the R:G:B ratio.
-    // Restore original per-channel balance to prevent warm/red color cast.
-    this._restoreColorBalance(outImageData, preAvg);
+    // --- Phase 10: Color-degrading processing REMOVED ---
+    // With emissive rendering, the photo displays at original brightness/color.
+    // These steps were compensating for PBR 1/π darkening and are now harmful.
+    // Method bodies kept in file for 'pbr' fallback mode and Phase 2.
+    // const preAvg = this._computeChannelAverages(outImageData);
+    // this._delightTexture(outImageData, size);
+    // this._smoothTextureColors(outImageData, size);
+    // this._restoreColorBalance(outImageData, preAvg);
 
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
