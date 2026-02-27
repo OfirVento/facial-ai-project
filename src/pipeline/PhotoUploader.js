@@ -2388,8 +2388,12 @@ export class PhotoUploader {
     // This normalizes each pixel to remove directional lighting while preserving
     // the overall brightness level (avgLum).
     // Use a mild strength factor to avoid over-flattening.
-    // Adaptive: darker pixels get less correction to preserve natural under-eye/shadow tones.
-    const BASE_STRENGTH = 0.2; // 0=no delighting, 1=full delighting
+    // Scale by photo brightness: well-lit photos need less delighting (shadows already subtle).
+    // Dark photos need more correction. Also adaptive per-pixel for under-eye preservation.
+    const MAX_STRENGTH = 0.2;
+    const lumScale = Math.min(1.0, Math.max(0.3, (180 - avgLum) / 80));
+    const BASE_STRENGTH = MAX_STRENGTH * lumScale;
+    console.log(`PhotoUploader DENSE: Delight strength scaled: avgLum=${avgLum.toFixed(1)}, lumScale=${lumScale.toFixed(2)}, BASE_STRENGTH=${BASE_STRENGTH.toFixed(3)}`);
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] === 0) continue;
 
@@ -2413,9 +2417,11 @@ export class PhotoUploader {
 
     console.log(`PhotoUploader DENSE: Delighting applied (avgLum=${avgLum.toFixed(1)}, radius=${blurRadius}, strength=${strength})`);
 
-    // --- 4. Brightness normalization: ensure texture isn't too dark/bright ---
-    // Target luminance ~140 is a good midpoint for natural skin under flat lighting
-    const TARGET_LUM = 140;
+    // --- 4. Brightness normalization: preserve source luminance ---
+    // Adaptive target: keep the source photo's own luminance unless it's extreme.
+    // Only clamp if very dark (<100) or very bright (>210).
+    // This prevents darkening bright selfies or brightening moody photos.
+    const TARGET_LUM = Math.min(210, Math.max(100, avgLum));
     let postLumSum = 0, postCount = 0;
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] === 0) continue;
@@ -2503,7 +2509,7 @@ export class PhotoUploader {
   _smoothTextureColors(imageData, size) {
     const data = imageData.data;
     const N = size * size;
-    const BLEND = 0.15;  // 15% blend toward local average (reduced to preserve skin detail)
+    const BLEND = 0.10;  // 10% blend toward local average (further reduced to preserve skin detail)
     const RADIUS = Math.max(4, Math.round(size / 256)); // ~8px at 2048
 
     // Extract RGB for mapped pixels

@@ -263,14 +263,14 @@ export class FaceRenderer {
       this.lights.rectArea.intensity = 0.15;       // minimal area light
     }
 
-    // Disable ACES tone mapping for photo mode.
-    // The photo texture is already in sRGB gamut from the camera.
-    // ACES applies a nonlinear S-curve that double-compresses highlights and
-    // lifts shadows, flattening skin detail and creating a "waxy" appearance.
+    // Use LinearToneMapping for photo mode.
+    // ACES was too aggressive (waxy S-curve), NoToneMapping was too flat/dark.
+    // LinearToneMapping provides neutral brightness without the S-curve distortion.
     if (this.renderer) {
       this._savedToneMapping = this.renderer.toneMapping;
       this._savedToneMappingExposure = this.renderer.toneMappingExposure;
-      this.renderer.toneMapping = THREE.NoToneMapping;
+      this.renderer.toneMapping = THREE.LinearToneMapping;
+      this.renderer.toneMappingExposure = 1.0;
     }
 
     console.log('FaceRenderer: Switched to photo-flat lighting (NoToneMapping)');
