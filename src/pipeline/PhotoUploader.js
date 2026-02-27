@@ -648,12 +648,21 @@ export class PhotoUploader {
     }
     console.log(`PhotoUploader DENSE: Mapped ${mappedPixels}/${totalPixels} pixels (${(mappedPixels / totalPixels * 100).toFixed(1)}%) after dilation`);
 
+    // --- 5b-pre. Save source photo's per-channel averages before processing ---
+    // Used to restore color balance after delight/smooth/brightness steps
+    const preAvg = this._computeChannelAverages(outImageData);
+
     // --- 5b. Delight the texture: remove baked-in photo shading ---
     // Divides out low-frequency luminance so 3D lighting can create proper shadows.
     this._delightTexture(outImageData, size);
 
     // --- 5b2. Color smoothing: reduce extreme local color variations ---
     this._smoothTextureColors(outImageData, size);
+
+    // --- 5b3. Restore source photo's color balance ---
+    // Processing (delight, smooth, brightness) can shift the R:G:B ratio.
+    // Restore original per-channel balance to prevent warm/red color cast.
+    this._restoreColorBalance(outImageData, preAvg);
 
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
@@ -1261,8 +1270,8 @@ export class PhotoUploader {
    */
   _fitExpressionFromLandmarks(landmarks, mapping, meshGen) {
     const NUM_COMPONENTS = 20;
-    const NUM_ITERATIONS = 5;
-    const LAMBDA = 0.05;
+    const NUM_ITERATIONS = 6;
+    const LAMBDA = 0.03;       // slightly lighter regularisation for better fit
     const LAMBDA_SYM = 0.05;
     const W_LIP = 3.0; // Weight boost for inner lip landmarks
 
@@ -2289,6 +2298,62 @@ export class PhotoUploader {
   }
 
   /**
+   * Compute per-channel average R, G, B of mapped pixels.
+   * @returns {{ r: number, g: number, b: number, count: number }}
+   */
+  _computeChannelAverages(imageData) {
+    const data = imageData.data;
+    const N = data.length / 4;
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
+    for (let i = 0; i < N; i++) {
+      if (data[i * 4 + 3] === 0) continue;
+      rSum += data[i * 4];
+      gSum += data[i * 4 + 1];
+      bSum += data[i * 4 + 2];
+      count++;
+    }
+    if (count === 0) return { r: 128, g: 128, b: 128, count: 0 };
+    return { r: rSum / count, g: gSum / count, b: bSum / count, count };
+  }
+
+  /**
+   * Restore the per-channel color balance to match a target (typically the source photo's
+   * original averages). This corrects any color cast introduced by delight/smooth/brightness steps.
+   * Uses per-channel scaling clamped to ±15% to avoid extreme corrections.
+   */
+  _restoreColorBalance(imageData, targetAvg) {
+    if (targetAvg.count < 100) return;
+
+    const currentAvg = this._computeChannelAverages(imageData);
+    if (currentAvg.count < 100) return;
+
+    // Compute per-channel correction factors
+    const factorR = targetAvg.r / Math.max(1, currentAvg.r);
+    const factorG = targetAvg.g / Math.max(1, currentAvg.g);
+    const factorB = targetAvg.b / Math.max(1, currentAvg.b);
+
+    // Clamp to ±15% to avoid extreme corrections
+    const clamp = (f) => Math.max(0.85, Math.min(1.15, f));
+    const fR = clamp(factorR), fG = clamp(factorG), fB = clamp(factorB);
+
+    if (Math.abs(fR - 1) < 0.02 && Math.abs(fG - 1) < 0.02 && Math.abs(fB - 1) < 0.02) {
+      console.log('PhotoUploader DENSE: Color balance OK, no correction needed');
+      return;
+    }
+
+    const data = imageData.data;
+    const N = data.length / 4;
+    for (let i = 0; i < N; i++) {
+      if (data[i * 4 + 3] === 0) continue;
+      data[i * 4]     = Math.min(255, Math.round(data[i * 4] * fR));
+      data[i * 4 + 1] = Math.min(255, Math.round(data[i * 4 + 1] * fG));
+      data[i * 4 + 2] = Math.min(255, Math.round(data[i * 4 + 2] * fB));
+    }
+
+    console.log(`PhotoUploader DENSE: Color balance restored: R×${fR.toFixed(3)}, G×${fG.toFixed(3)}, B×${fB.toFixed(3)}`);
+  }
+
+  /**
    * Gently smooth the texture colors to reduce reddish patches and uneven tones.
    * Blends each pixel 25% toward its local average (box-blurred version).
    * Only operates on mapped pixels (alpha > 0). Preserves detail while reducing extremes.
@@ -2345,10 +2410,16 @@ export class PhotoUploader {
         }
       }
 
-      // Blend: pixel = (1-BLEND)*original + BLEND*blurred
+      // Adaptive blend: darker pixels blend more strongly toward local average
+      // This reduces dark circles/shadows while preserving well-lit areas
       for (let i = 0; i < N; i++) {
         if (data[i * 4 + 3] === 0) continue;
-        const smoothed = (1 - BLEND) * src[i] + BLEND * blurred[i];
+        // Compute pixel luminance
+        const lum = 0.2126 * data[i * 4] + 0.7152 * data[i * 4 + 1] + 0.0722 * data[i * 4 + 2];
+        // Darker pixels get stronger blending (up to 2x BLEND for very dark areas)
+        const darkBoost = lum < 100 ? BLEND * (1 + (100 - lum) / 100) : BLEND;
+        const adaptiveBlend = Math.min(0.5, darkBoost); // cap at 50%
+        const smoothed = (1 - adaptiveBlend) * src[i] + adaptiveBlend * blurred[i];
         data[i * 4 + ch] = Math.round(Math.max(0, Math.min(255, smoothed)));
       }
     }
