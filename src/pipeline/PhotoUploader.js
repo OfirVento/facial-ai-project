@@ -644,8 +644,8 @@ export class PhotoUploader {
     }
 
     // --- 5a3. Edge dilation: expand mapped pixels into unmapped (alpha=0) regions ---
-    // Increased to 40 passes to compensate for eroded face boundary mask (P0).
-    this._dilateEdges(outImageData, size, 40);
+    // Phase 10b: 80 passes (was 40) — pushes face-edge skin further into ear/neck UV areas.
+    this._dilateEdges(outImageData, size, 80);
 
     // --- 5a4. Blur dilated band: smooth transition between original and dilated pixels ---
     this._blurDilatedBand(outImageData, size, preDilationAlpha);
@@ -691,7 +691,8 @@ export class PhotoUploader {
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    this._softenAlphaBoundary(outImageData, size, Math.max(12, Math.round(size / 64)));
+    // Phase 10b: wider radius (size/32 vs size/64) for smoother photo→albedo transition
+    this._softenAlphaBoundary(outImageData, size, Math.max(16, Math.round(size / 32)));
 
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
@@ -3168,6 +3169,22 @@ export class PhotoUploader {
     const crG = Math.max(0.3, Math.min(3.0, median(ratiosG)));
     const crB = Math.max(0.3, Math.min(3.0, median(ratiosB)));
     console.log(`Albedo color correction (MEDIAN): R=${crR.toFixed(3)}, G=${crG.toFixed(3)}, B=${crB.toFixed(3)}, samples=${samples.length}`);
+
+    // Phase 10b diagnostic: compare photo vs corrected albedo luminance + per-channel RGB
+    const avgPhotoR = samples.reduce((s, x) => s + x.pr, 0) / samples.length;
+    const avgPhotoG = samples.reduce((s, x) => s + x.pg, 0) / samples.length;
+    const avgPhotoB = samples.reduce((s, x) => s + x.pb, 0) / samples.length;
+    const avgAlbedoR = samples.reduce((s, x) => s + x.ar, 0) / samples.length;
+    const avgAlbedoG = samples.reduce((s, x) => s + x.ag, 0) / samples.length;
+    const avgAlbedoB = samples.reduce((s, x) => s + x.ab, 0) / samples.length;
+    const photoLum = avgPhotoR * 0.2126 + avgPhotoG * 0.7152 + avgPhotoB * 0.0722;
+    const correctedLum = (avgAlbedoR * crR) * 0.2126 + (avgAlbedoG * crG) * 0.7152 + (avgAlbedoB * crB) * 0.0722;
+    const lumRatio = correctedLum / Math.max(1, photoLum);
+    console.log(`Albedo tinting DIAG: photo lum=${photoLum.toFixed(1)}, corrected albedo lum=${correctedLum.toFixed(1)}, ratio=${lumRatio.toFixed(2)}`);
+    console.log(`Albedo tinting DIAG: photo RGB=(${avgPhotoR.toFixed(0)},${avgPhotoG.toFixed(0)},${avgPhotoB.toFixed(0)}), corrected albedo RGB=(${(avgAlbedoR*crR).toFixed(0)},${(avgAlbedoG*crG).toFixed(0)},${(avgAlbedoB*crB).toFixed(0)})`);
+    if (Math.abs(lumRatio - 1.0) > 0.15) {
+      console.warn(`Albedo tinting WARNING: luminance mismatch ${((lumRatio - 1.0) * 100).toFixed(0)}% — tinting may need adjustment`);
+    }
 
     // Fill every pixel with color-corrected albedo
     for (let i = 0; i < size * size; i++) {
