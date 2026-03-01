@@ -375,6 +375,7 @@ export class FaceRenderer {
     // Per-material tone mapping bypass — no global renderer change
     // Avoids scene-wide shader recompilation
     mat.toneMapped = false;
+    mat.envMapIntensity = 0;     // Hotfix: kill HDRI contribution in emissive mode
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
@@ -410,6 +411,7 @@ export class FaceRenderer {
     mat.clearcoat = 0.05;
 
     mat.toneMapped = true;
+    mat.envMapIntensity = 1.0;   // Restore HDRI for default PBR mesh
     mat.side = THREE.DoubleSide;
 
     mat.needsUpdate = true;
