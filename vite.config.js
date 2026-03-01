@@ -1,4 +1,5 @@
 import { defineConfig } from 'vite';
+import { resolve } from 'path';
 
 export default defineConfig({
   root: '.',
@@ -9,7 +10,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    chunkSizeWarningLimit: 1000
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        lab: resolve(__dirname, 'lab.html'),
+      },
+    },
   },
   assetsInclude: ['**/*.obj', '**/*.glb', '**/*.gltf', '**/*.hdr']
 });

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FacialAI Lab — Benchmark Viewer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/src/lab/lab-styles.css">
+</head>
+<body>
+  <div id="lab-app" class="lab-layout">
+
+    <!-- ==================== TOP BAR ==================== -->
+    <header class="lab-top-bar">
+      <div class="lab-top-left">
+        <a href="/" class="lab-back-link" title="Back to main app">&larr;</a>
+        <span class="lab-logo">Facial<span class="logo-accent">AI</span> <span class="lab-badge">Lab</span></span>
+      </div>
+      <div class="lab-top-center">
+        <span class="lab-title">Benchmark Viewer</span>
+      </div>
+      <div class="lab-top-right">
+        <button class="lab-btn" id="load-glb-btn" title="Load GLB/glTF file">📁 Load GLB</button>
+        <button class="lab-btn" id="load-photo-btn" title="Upload photo for FLAME pipeline">📸 Upload Photo</button>
+        <input type="file" id="glb-file-input" accept=".glb,.gltf" hidden>
+        <input type="file" id="photo-file-input" accept="image/*" hidden>
+      </div>
+    </header>
+
+    <!-- ==================== SPLIT VIEWPORT ==================== -->
+    <main class="lab-viewports">
+      <!-- Left panel: Lumirithmic / GLB -->
+      <div class="lab-panel lab-panel-left">
+        <div class="lab-panel-header">
+          <span class="lab-panel-label">Lumirithmic (GLB)</span>
+          <span class="lab-panel-badge" id="left-status">No model</span>
+        </div>
+        <div class="lab-viewport" id="viewport-left">
+          <div class="lab-drop-zone" id="drop-zone-left">
+            <div class="drop-icon">📦</div>
+            <span>Drag & drop .glb/.gltf here</span>
+            <span class="drop-hint">or click "Load GLB" above</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Divider -->
+      <div class="lab-divider" id="lab-divider">
+        <div class="lab-divider-handle"></div>
+      </div>
+
+      <!-- Right panel: Custom FLAME -->
+      <div class="lab-panel lab-panel-right">
+        <div class="lab-panel-header">
+          <span class="lab-panel-label">Custom FLAME</span>
+          <span class="lab-panel-badge" id="right-status">Default mesh</span>
+        </div>
+        <div class="lab-viewport" id="viewport-right">
+          <!-- FaceRenderer mounts here -->
+        </div>
+      </div>
+    </main>
+
+    <!-- ==================== STATS BAR ==================== -->
+    <footer class="lab-stats-bar">
+      <span class="lab-stat" id="stat-hdri">HDRI: loading...</span>
+      <span class="lab-stat" id="stat-left-verts">L verts: —</span>
+      <span class="lab-stat" id="stat-right-verts">R verts: —</span>
+      <span class="lab-stat" id="stat-fps">FPS: —</span>
+      <span class="lab-stat" id="stat-sync">Sync: linked</span>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/lab/LabApp.js"></script>
+</body>
+</html>

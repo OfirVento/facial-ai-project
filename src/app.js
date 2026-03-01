@@ -13,6 +13,7 @@ import { VoiceAgent } from './agents/VoiceAgent.js';
 import { ConversationDirector } from './agents/ConversationDirector.js';
 import { PhotoUploader } from './pipeline/PhotoUploader.js';
 import { MediaPipeBridge } from './engine/MediaPipeBridge.js';
+import { HDRIManager } from './engine/HDRIManager.js';
 
 class FacialAIProject {
   constructor() {
@@ -53,6 +54,18 @@ class FacialAIProject {
     if (viewport) {
       this.renderer = new FaceRenderer(viewport);
       this.renderer.init();
+    }
+
+    // Load HDRI environment for PBR lighting (Phase 0)
+    if (this.renderer) {
+      try {
+        this.hdriManager = new HDRIManager(this.renderer.renderer);
+        const envMap = await this.hdriManager.load('/hdri/studio_small_09_2k.hdr');
+        this.renderer.setEnvironment(envMap, 1.0);
+        console.log('App: HDRI environment loaded successfully');
+      } catch (err) {
+        console.warn('App: HDRI loading failed, continuing without IBL:', err.message);
+      }
     }
 
     // Generate demo face mesh (tries real FLAME first, falls back to analytic)

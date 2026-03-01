@@ -1,0 +1,317 @@
+/* ================================================================
+   FACIAL AI LAB — Benchmark Viewer Styles
+   ================================================================ */
+
+:root {
+  --bg-primary: #08081a;
+  --bg-secondary: #0e0e28;
+  --bg-panel: #141438;
+  --bg-card: #1c1c48;
+  --bg-hover: #24245a;
+  --bg-input: #18183e;
+  --text-primary: #eaeaf4;
+  --text-secondary: #9898c0;
+  --text-muted: #6868a0;
+  --text-dim: #4a4a80;
+  --accent: #7c5cff;
+  --accent-light: #a08cff;
+  --accent-dim: #5a3fd4;
+  --accent-glow: rgba(124, 92, 255, 0.25);
+  --success: #4ade80;
+  --success-bg: rgba(74, 222, 128, 0.1);
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --border: rgba(255, 255, 255, 0.06);
+  --border-light: rgba(255, 255, 255, 0.1);
+  --border-active: rgba(124, 92, 255, 0.4);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-xs: 6px;
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --transition: 0.2s ease;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--font);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ================================================================
+   LAYOUT — Full height with top bar + split + stats bar
+   ================================================================ */
+
+.lab-layout {
+  display: grid;
+  grid-template-rows: 48px 1fr 32px;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ================================================================
+   TOP BAR
+   ================================================================ */
+
+.lab-top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  z-index: 10;
+}
+
+.lab-top-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.lab-back-link {
+  font-size: 18px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-xs);
+  transition: var(--transition);
+}
+.lab-back-link:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.lab-logo {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.logo-accent {
+  color: var(--accent);
+}
+.lab-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-light);
+  background: rgba(124, 92, 255, 0.15);
+  padding: 2px 8px;
+  border-radius: 10px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.lab-top-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.lab-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
+
+.lab-top-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lab-btn {
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  padding: 6px 14px;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: var(--transition);
+}
+.lab-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-active);
+}
+
+/* ================================================================
+   SPLIT VIEWPORTS
+   ================================================================ */
+
+.lab-viewports {
+  display: flex;
+  overflow: hidden;
+  position: relative;
+}
+
+.lab-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  position: relative;
+}
+
+.lab-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.lab-panel-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.01em;
+}
+
+.lab-panel-badge {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.lab-viewport {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+/* Canvas should fill the viewport container */
+.lab-viewport canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+/* ================================================================
+   DROP ZONE (for GLB drag & drop on left panel)
+   ================================================================ */
+
+.lab-drop-zone {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  z-index: 5;
+  transition: var(--transition);
+  pointer-events: none;
+}
+
+.lab-drop-zone.active {
+  background: rgba(124, 92, 255, 0.08);
+  border: 2px dashed var(--accent);
+}
+
+.lab-drop-zone.hidden {
+  display: none;
+}
+
+.drop-icon {
+  font-size: 36px;
+  opacity: 0.4;
+}
+
+.lab-drop-zone span {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.drop-hint {
+  font-size: 11px !important;
+  color: var(--text-dim) !important;
+}
+
+/* ================================================================
+   DIVIDER (draggable split handle)
+   ================================================================ */
+
+.lab-divider {
+  width: 6px;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  z-index: 5;
+  transition: background 0.15s;
+}
+.lab-divider:hover,
+.lab-divider.dragging {
+  background: var(--accent-dim);
+}
+
+.lab-divider-handle {
+  width: 2px;
+  height: 40px;
+  background: var(--text-dim);
+  border-radius: 2px;
+  opacity: 0.5;
+}
+
+/* ================================================================
+   STATS BAR (bottom)
+   ================================================================ */
+
+.lab-stats-bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 0 16px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.lab-stat {
+  white-space: nowrap;
+}
+
+/* ================================================================
+   RESPONSIVE
+   ================================================================ */
+
+@media (max-width: 768px) {
+  .lab-viewports {
+    flex-direction: column;
+  }
+  .lab-divider {
+    width: 100%;
+    height: 6px;
+    cursor: row-resize;
+  }
+  .lab-divider-handle {
+    width: 40px;
+    height: 2px;
+  }
+}

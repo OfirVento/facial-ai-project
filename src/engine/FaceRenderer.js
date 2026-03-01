@@ -274,6 +274,74 @@ export class FaceRenderer {
     console.log('FaceRenderer: Switched to photo-flat lighting');
   }
 
+  // -- HDRI Environment (Phase 0) ------------------------------------------
+
+  /**
+   * Apply an HDRI environment map for Image-Based Lighting (IBL).
+   * This enables natural irradiance and specular reflections on all PBR materials
+   * without setting the environment as the scene background (keeps gradient bg).
+   *
+   * @param {THREE.Texture} envMap - Prefiltered environment map from HDRIManager.
+   * @param {number} [intensity=1.0] - Environment map intensity for the face material.
+   */
+  setEnvironment(envMap, intensity = 1.0) {
+    if (!this.scene) return;
+
+    // Set scene environment for IBL on all PBR materials
+    this.scene.environment = envMap;
+
+    // Fine-tune envMap intensity on the face material
+    if (this.faceMaterial) {
+      this.faceMaterial.envMapIntensity = intensity;
+      this.faceMaterial.needsUpdate = true;
+    }
+
+    console.log(`FaceRenderer: Environment map applied (intensity=${intensity})`);
+  }
+
+  // -- Camera State (Phase 0 — for Lab sync) --------------------------------
+
+  /**
+   * Get the current spherical camera state (for syncing to another renderer).
+   * @returns {{ theta: number, phi: number, radius: number, target: {x:number, y:number, z:number} }}
+   */
+  getSphericalState() {
+    return {
+      theta: this._spherical.theta,
+      phi: this._spherical.phi,
+      radius: this._spherical.radius,
+      target: {
+        x: this._orbitTarget.x,
+        y: this._orbitTarget.y,
+        z: this._orbitTarget.z,
+      },
+    };
+  }
+
+  /**
+   * Set the camera spherical state (for syncing from another renderer).
+   * Directly sets both current and target to avoid lerp delay.
+   * @param {{ theta: number, phi: number, radius: number, target?: {x:number, y:number, z:number} }} state
+   */
+  setSphericalState(state) {
+    if (state.theta !== undefined) {
+      this._spherical.theta = state.theta;
+      this._sphericalTarget.theta = state.theta;
+    }
+    if (state.phi !== undefined) {
+      this._spherical.phi = state.phi;
+      this._sphericalTarget.phi = state.phi;
+    }
+    if (state.radius !== undefined) {
+      this._spherical.radius = state.radius;
+      this._sphericalTarget.radius = state.radius;
+    }
+    if (state.target) {
+      this._orbitTarget.set(state.target.x, state.target.y, state.target.z);
+    }
+    this._applyCameraSpherical(this._spherical);
+  }
+
   // -- Photo render mode (Phase 10) ----------------------------------------
 
   /**
@@ -1317,6 +1385,9 @@ export class FaceRenderer {
     }
 
     this._unbindEvents();
+
+    // Clear environment reference (don't dispose — may be shared)
+    if (this.scene) this.scene.environment = null;
 
     // Dispose face mesh
     this._removeFaceMesh();
