@@ -679,14 +679,13 @@ export class PhotoUploader {
     this._debugCoverageMask = coverageCanvas.toDataURL('image/png');
     console.log('PhotoUploader DIAG: UV coverage mask saved to _debugCoverageMask');
 
-    // --- Phase 10: Color-degrading processing REMOVED ---
-    // With emissive rendering, the photo displays at original brightness/color.
-    // These steps were compensating for PBR 1/π darkening and are now harmful.
-    // Method bodies kept in file for 'pbr' fallback mode and Phase 2.
-    // const preAvg = this._computeChannelAverages(outImageData);
-    // this._delightTexture(outImageData, size);
-    // this._smoothTextureColors(outImageData, size);
-    // this._restoreColorBalance(outImageData, preAvg);
+    // --- Phase 2: Restore processing pipeline for PBR + HDRI ---
+    // With proper HDRI lighting, delighting removes baked photo shadows
+    // that would otherwise cause double-shadowing with 3D lights.
+    const preAvg = this._computeChannelAverages(outImageData);
+    this._delightTexture(outImageData, size);
+    this._smoothTextureColors(outImageData, size);
+    this._restoreColorBalance(outImageData, preAvg);
 
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.

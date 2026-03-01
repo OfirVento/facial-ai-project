@@ -141,8 +141,8 @@ export class FaceRenderer {
     // Lights (stored for potential external tweaking)
     this.lights = {};
 
-    // Photo render mode (Phase 10)
-    this._photoRenderMode = 'emissive';   // 'emissive' | 'pbr' | 'hybrid'
+    // Photo render mode (Phase 2: PBR is now default with HDRI)
+    this._photoRenderMode = 'pbr';        // 'pbr' | 'emissive' | 'hybrid'
     this._photoExposure = 1.0;            // neutral default — hook for future UI
     this._photoWhiteBalance = 0xffffff;   // neutral default — hook for future UI
   }
@@ -245,33 +245,54 @@ export class FaceRenderer {
    * The photo already contains its own shading information.
    */
   _setPhotoLighting() {
-    // Photo texture already contains real-world shading.
-    // Use nearly flat lighting to avoid double-shadowing.
-    // Only add minimal directional cues for 3D depth perception.
-    if (this.lights.key) {
-      this.lights.key.intensity = 0.25;            // very subtle directional cue
-      this.lights.key.color.set(0xffffff);         // neutral white
-      this.lights.key.castShadow = false;          // no shadow casting on photo texture
-    }
-    if (this.lights.fill) {
-      this.lights.fill.intensity = 0.25;           // balanced with key
-      this.lights.fill.color.set(0xffffff);        // neutral
-    }
-    if (this.lights.rim) {
-      this.lights.rim.intensity = 0.1;             // barely visible rim
-    }
-    if (this.lights.ambient) {
-      this.lights.ambient.intensity = 1.05;        // dominant ambient — photo IS the shading
-      this.lights.ambient.color.set(0xffffff);     // neutral
-    }
-    if (this.lights.rectArea) {
-      this.lights.rectArea.intensity = 0.15;       // minimal area light
-    }
+    const hasHDRI = this.scene && this.scene.environment;
 
-    // Phase 10: Tone mapping is now handled per-material (material.toneMapped = false)
-    // No global renderer.toneMapping change needed — avoids scene-wide shader recompilation.
-
-    console.log('FaceRenderer: Switched to photo-flat lighting');
+    if (hasHDRI) {
+      // Phase 2: HDRI provides the primary illumination.
+      // Keep directional lights very low — just subtle fill cues.
+      if (this.lights.key) {
+        this.lights.key.intensity = 0.3;
+        this.lights.key.color.set(0xffffff);
+        this.lights.key.castShadow = false;
+      }
+      if (this.lights.fill) {
+        this.lights.fill.intensity = 0.15;
+        this.lights.fill.color.set(0xffffff);
+      }
+      if (this.lights.rim) {
+        this.lights.rim.intensity = 0.1;
+      }
+      if (this.lights.ambient) {
+        this.lights.ambient.intensity = 0.2;       // low — HDRI ambient handles this
+        this.lights.ambient.color.set(0xffffff);
+      }
+      if (this.lights.rectArea) {
+        this.lights.rectArea.intensity = 0.1;
+      }
+      console.log('FaceRenderer: Photo lighting (HDRI-assisted)');
+    } else {
+      // Fallback: no HDRI — use nearly flat lighting (Phase 10 legacy)
+      if (this.lights.key) {
+        this.lights.key.intensity = 0.25;
+        this.lights.key.color.set(0xffffff);
+        this.lights.key.castShadow = false;
+      }
+      if (this.lights.fill) {
+        this.lights.fill.intensity = 0.25;
+        this.lights.fill.color.set(0xffffff);
+      }
+      if (this.lights.rim) {
+        this.lights.rim.intensity = 0.1;
+      }
+      if (this.lights.ambient) {
+        this.lights.ambient.intensity = 1.05;
+        this.lights.ambient.color.set(0xffffff);
+      }
+      if (this.lights.rectArea) {
+        this.lights.rectArea.intensity = 0.15;
+      }
+      console.log('FaceRenderer: Photo lighting (flat, no HDRI)');
+    }
   }
 
   // -- HDRI Environment (Phase 0) ------------------------------------------
@@ -342,48 +363,89 @@ export class FaceRenderer {
     this._applyCameraSpherical(this._spherical);
   }
 
-  // -- Photo render mode (Phase 10) ----------------------------------------
+  // -- Photo render mode (Phase 2: PBR default, emissive fallback) ----------
 
   /**
-   * Switch material to emissive photo mode.
-   * Routes photo texture through the emissive path (bypasses BRDF 1/π darkening)
-   * while keeping the same MeshPhysicalMaterial instance.
+   * Switch material to PBR photo mode (Phase 2).
+   * Photo texture goes through the standard diffuse `map` channel.
+   * HDRI environment provides natural irradiance + specular reflections.
+   * Tone mapping stays ON for proper color management.
    */
-  _setPhotoMode(texture) {
+  _setPbrPhotoMode(texture) {
     const mat = this.faceMaterial;
 
-    // Route photo through emissive path → bypasses BRDF 1/π darkening
-    // Emissive formula: output = emissiveMap × emissive × emissiveIntensity
-    // With emissive=white, intensity=1.0: output = texture × 1.0 = exact photo
-    mat.emissiveMap = texture;
-    mat.emissive.set(this._photoWhiteBalance ?? 0xffffff);
-    mat.emissiveIntensity = this._photoExposure ?? 1.0;
+    // Clear any emissive state from previous mode
+    if (mat.emissiveMap) { mat.emissiveMap.dispose(); mat.emissiveMap = null; }
+    mat.emissive.set(0x000000);
+    mat.emissiveIntensity = 1.0;
 
-    // Kill diffuse path: color=black means diffuse contributes 0
-    // This eliminates the 1/π Lambertian normalization factor entirely
-    mat.map = null;
-    mat.color.set(0x000000);
+    // Photo through standard diffuse channel — HDRI provides lighting
+    mat.map = texture;
+    mat.color.set(0xffffff);      // don't tint the texture
 
-    // Disable PBR extras that could interfere
-    mat.sheen = 0.0;
-    mat.clearcoat = 0.0;
-    mat.transmission = 0;
-    mat.thickness = 0;
-    mat.roughness = 1.0;        // fully matte → near-zero specular (Phase 2: reduce for depth)
+    // Moderate PBR for realistic skin appearance
+    mat.roughness = 0.6;          // slightly rough skin
     mat.metalness = 0.0;
+    mat.sheen = 0.15;             // subtle skin micro-fiber look
+    mat.sheenRoughness = 0.5;
+    mat.sheenColor.set(0xffddcc);
+    mat.clearcoat = 0.03;         // minimal oily highlights
+    mat.clearcoatRoughness = 0.4;
+    mat.transmission = 0;         // no SSS on photo-textured mesh
+    mat.thickness = 0;
 
-    // Per-material tone mapping bypass — no global renderer change
-    // Avoids scene-wide shader recompilation
-    mat.toneMapped = false;
-    mat.envMapIntensity = 0;     // Hotfix: kill HDRI contribution in emissive mode
+    // Tone mapping ON — proper ACES color management
+    mat.toneMapped = true;
+    mat.envMapIntensity = 1.0;    // full HDRI contribution
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
 
-    // Adjust lighting for photo mode
+    // Adjust lighting for HDRI photo mode
     this._setPhotoLighting();
 
-    console.log('FaceRenderer: Photo mode (emissive path, toneMapped=false)');
+    // Bump exposure slightly to compensate for ACES midtone compression
+    if (this.renderer) {
+      this.renderer.toneMappingExposure = 1.2;
+    }
+
+    console.log('FaceRenderer: PBR photo mode (HDRI + tone mapping enabled)');
+  }
+
+  /**
+   * Switch material to emissive photo mode (Phase 10 legacy — for A/B testing).
+   * Routes photo texture through the emissive path (bypasses BRDF 1/π darkening).
+   */
+  _setEmissivePhotoMode(texture) {
+    const mat = this.faceMaterial;
+
+    // Route photo through emissive path → bypasses BRDF 1/π darkening
+    mat.emissiveMap = texture;
+    mat.emissive.set(this._photoWhiteBalance ?? 0xffffff);
+    mat.emissiveIntensity = this._photoExposure ?? 1.0;
+
+    // Kill diffuse path
+    mat.map = null;
+    mat.color.set(0x000000);
+
+    // Disable PBR extras
+    mat.sheen = 0.0;
+    mat.clearcoat = 0.0;
+    mat.transmission = 0;
+    mat.thickness = 0;
+    mat.roughness = 1.0;
+    mat.metalness = 0.0;
+
+    // Bypass tone mapping and HDRI
+    mat.toneMapped = false;
+    mat.envMapIntensity = 0;
+    mat.side = THREE.FrontSide;
+
+    mat.needsUpdate = true;
+
+    this._setPhotoLighting();
+
+    console.log('FaceRenderer: Emissive photo mode (legacy, toneMapped=false)');
   }
 
   /**
@@ -415,6 +477,11 @@ export class FaceRenderer {
     mat.side = THREE.DoubleSide;
 
     mat.needsUpdate = true;
+
+    // Reset exposure to default
+    if (this.renderer) {
+      this.renderer.toneMappingExposure = 1.0;
+    }
 
     console.log('FaceRenderer: Restored default PBR mode');
   }
@@ -552,20 +619,11 @@ export class FaceRenderer {
     switch (type) {
       case 'albedo':
         if (this._photoRenderMode === 'emissive') {
-          // Phase 10: Route through emissive path for exact photo fidelity
-          this._setPhotoMode(texture);
+          // Phase 10 legacy: emissive bypass (for A/B comparison)
+          this._setEmissivePhotoMode(texture);
         } else {
-          // PBR fallback (original code path)
-          this.faceMaterial.map = texture;
-          this.faceMaterial.color.set(0xffffff);
-          if (this.faceMaterial.isMeshPhysicalMaterial) {
-            this.faceMaterial.sheen = 0.0;
-            this.faceMaterial.clearcoat = 0.0;
-            this.faceMaterial.transmission = 0;
-            this.faceMaterial.thickness = 0;
-            this.faceMaterial.roughness = 0.85;
-          }
-          this._setPhotoLighting();
+          // Phase 2: PBR photo mode with HDRI environment
+          this._setPbrPhotoMode(texture);
         }
         break;
       case 'normal':
