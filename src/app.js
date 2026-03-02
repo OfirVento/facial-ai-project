@@ -431,20 +431,38 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     // Generate button
     document.getElementById('generate-btn')?.addEventListener('click', async () => {
       const btn = document.getElementById('generate-btn');
-      btn.textContent = 'Detecting face...';
+      console.log('Generate button clicked');
+      btn.textContent = 'Loading AI model...';
       btn.disabled = true;
 
       try {
         // Lazy-init MediaPipeBridge and pass to uploader
         if (!this.mediaPipeBridge) {
+          console.log('App: Creating MediaPipeBridge...');
           this.mediaPipeBridge = new MediaPipeBridge();
         }
         this.photoUploader._mediaPipeBridge = this.mediaPipeBridge;
 
-        btn.textContent = 'Generating texture...';
+        // Pre-init MediaPipe so we can show progress
+        if (!this.mediaPipeBridge.isReady) {
+          console.log('App: Initializing MediaPipe (first time, may take 10-20s)...');
+          btn.textContent = 'Loading face AI (first time)...';
+          const ok = await this.mediaPipeBridge.init();
+          if (!ok) {
+            console.warn('App: MediaPipe init failed, will use fallback projection');
+          } else {
+            console.log('App: MediaPipe ready');
+          }
+        }
+
+        btn.textContent = 'Detecting face...';
+        console.log('App: Calling generateTextureFromPhoto...');
 
         // Generate texture from photo (uses piecewise affine warp if possible)
         const texture = await this.photoUploader.generateTextureFromPhoto();
+        console.log('App: Texture generated, applying...');
+
+        btn.textContent = 'Applying texture...';
         const normalMap = await this.photoUploader.generateNormalMapFromPhoto();
 
         // Apply photo texture to existing mesh
@@ -462,8 +480,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
 
         this._addMessage('system', 'Photo texture projected onto 3D model. Debug panel shown below viewport.');
         btn.textContent = '✓ Generated';
+        console.log('App: Generation complete');
       } catch (err) {
-        console.error(err);
+        console.error('App: Generation failed:', err);
         this._addMessage('system', `Error: ${err.message}`);
         btn.textContent = 'Generate 3D Model';
         btn.disabled = false;
