@@ -419,7 +419,11 @@ You can now modify specific regions — try saying "make my nose thinner" or use
 
           // Enable generate button if front photo exists
           const status = this.photoUploader.getStatus();
-          document.getElementById('generate-btn').disabled = !status.canReconstruct;
+          const genBtn = document.getElementById('generate-btn');
+          genBtn.disabled = !status.canReconstruct;
+          if (status.canReconstruct) {
+            genBtn.textContent = 'Generate 3D Model';  // Reset text for re-generation
+          }
         }
       });
     });
