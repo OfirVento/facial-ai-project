@@ -2408,7 +2408,7 @@ export class PhotoUploader {
       data[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(data[i * 4 + 2] * factor)));
     }
 
-    console.log(`PhotoUploader DENSE: Delighting applied (avgLum=${avgLum.toFixed(1)}, radius=${blurRadius}, strength=${strength})`);
+    console.log(`PhotoUploader DENSE: Delighting applied (avgLum=${avgLum.toFixed(1)}, radius=${blurRadius}, baseStrength=${BASE_STRENGTH.toFixed(3)})`);
 
     // --- 4. Brightness normalization: preserve source luminance ---
     // Adaptive target: keep the source photo's own luminance unless it's extreme.
