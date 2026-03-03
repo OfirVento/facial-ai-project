@@ -248,11 +248,11 @@ export class FaceRenderer {
     const hasHDRI = this.scene && this.scene.environment;
 
     if (hasHDRI) {
-      // Phase 2: Photo already contains baked lighting.
-      // With reduced envMapIntensity (0.3), direct lights provide subtle 3D cues.
-      // Total light energy kept low to preserve photo's original brightness.
+      // Expert calibration: HDRI provides primary illumination.
+      // Direct lights add subtle fill only — don't double-light the photo.
+      // Values calibrated with 0.18 gray sphere.
       if (this.lights.key) {
-        this.lights.key.intensity = 0.15;          // very subtle directional cue
+        this.lights.key.intensity = 0.2;
         this.lights.key.color.set(0xffffff);
         this.lights.key.castShadow = false;
       }
@@ -261,16 +261,16 @@ export class FaceRenderer {
         this.lights.fill.color.set(0xffffff);
       }
       if (this.lights.rim) {
-        this.lights.rim.intensity = 0.05;
+        this.lights.rim.intensity = 0.08;
       }
       if (this.lights.ambient) {
-        this.lights.ambient.intensity = 0.15;      // minimal — env + photo handle this
+        this.lights.ambient.intensity = 0.0;       // HDRI provides ambient — no double-up
         this.lights.ambient.color.set(0xffffff);
       }
       if (this.lights.rectArea) {
-        this.lights.rectArea.intensity = 0.05;
+        this.lights.rectArea.intensity = 0.0;      // HDRI replaces softbox
       }
-      console.log('FaceRenderer: Photo lighting (HDRI-assisted, reduced)');
+      console.log('FaceRenderer: Photo lighting (HDRI-calibrated)');
     } else {
       // Fallback: no HDRI — use nearly flat lighting (Phase 10 legacy)
       if (this.lights.key) {
@@ -384,23 +384,20 @@ export class FaceRenderer {
     mat.map = texture;
     mat.color.set(0xffffff);      // don't tint the texture
 
-    // Conservative PBR for photo-textured face:
-    // The photo already contains most visual detail — PBR adds subtle 3D cues only
-    mat.roughness = 0.75;         // fairly rough → minimizes specular washing out the photo
+    // Expert-mandated PBR values for photo-textured face:
+    // sheen=0 (cloth/fuzz, not skin), clearcoat=0 (car paint, creates waxy double-specular)
+    // Let HDRI handle natural skin reflections via roughness alone.
+    mat.roughness = 0.65;         // 0.6-0.75 range per expert. Let HDRI handle highlights.
     mat.metalness = 0.0;
-    mat.sheen = 0.08;             // very subtle skin micro-fiber look
-    mat.sheenRoughness = 0.6;
-    mat.sheenColor.set(0xffddcc);
-    mat.clearcoat = 0.02;         // barely visible oily highlights
-    mat.clearcoatRoughness = 0.5;
+    mat.sheen = 0.0;              // Expert: disabled — sheen is for cloth, not skin
+    mat.clearcoat = 0.0;          // Expert: disabled — creates waxy double-specular
     mat.transmission = 0;         // no SSS on photo-textured mesh
     mat.thickness = 0;
 
     // Tone mapping ON — proper ACES color management
     mat.toneMapped = true;
-    // Reduced HDRI contribution — photo already has baked lighting,
-    // we only want subtle environment fill, not full IBL
-    mat.envMapIntensity = 0.3;
+    // Expert: don't fight 1/π — set envMapIntensity=1.0, calibrate with gray sphere
+    mat.envMapIntensity = 1.0;
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
@@ -1121,6 +1118,95 @@ export class FaceRenderer {
     // Render one frame to make sure the buffer is current
     this.renderer.render(this.scene, this.camera);
     return this.renderer.domElement.toDataURL('image/png');
+  }
+
+  // -----------------------------------------------------------------------
+  // Diagnostic Tools (Expert Calibration)
+  // -----------------------------------------------------------------------
+
+  /**
+   * A/B Quad Test: Place a flat plane in the scene with the current face
+   * texture applied via MeshBasicMaterial (no lighting, no PBR).
+   * If the quad looks correct but the head looks pale → lighting/material issue.
+   * If the quad also looks pale → texture pipeline issue.
+   */
+  showQuadTest() {
+    // Remove existing quad if any
+    this.hideQuadTest();
+
+    if (!this.faceMaterial || !this.faceMaterial.map) {
+      console.warn('FaceRenderer: No texture loaded — cannot show quad test');
+      return;
+    }
+
+    const texture = this.faceMaterial.map;
+
+    // Create a flat plane with MeshBasicMaterial (unlit, no PBR, no tone mapping)
+    const quadGeo = new THREE.PlaneGeometry(0.12, 0.12);
+    const quadMat = new THREE.MeshBasicMaterial({
+      map: texture,
+      toneMapped: false, // raw pixel passthrough — no ACES darkening
+      side: THREE.DoubleSide,
+    });
+    this._quadTestMesh = new THREE.Mesh(quadGeo, quadMat);
+
+    // Position to the right of the face
+    const offset = this._orbitTarget.clone();
+    offset.x += 0.15;
+    offset.y += 0.05;
+    this._quadTestMesh.position.copy(offset);
+    this._quadTestMesh.renderOrder = 10;
+
+    this.scene.add(this._quadTestMesh);
+    console.log('FaceRenderer: Quad test shown (MeshBasicMaterial, toneMapped=false)');
+  }
+
+  /** Remove the A/B quad test plane. */
+  hideQuadTest() {
+    if (this._quadTestMesh) {
+      this.scene.remove(this._quadTestMesh);
+      this._quadTestMesh.geometry.dispose();
+      this._quadTestMesh.material.dispose();
+      this._quadTestMesh = null;
+    }
+  }
+
+  /**
+   * 0.18 Gray Sphere: Spawn a middle-gray sphere (sRGB 0x808080 ≈ 18% reflectance)
+   * with roughness=1.0 for lighting calibration.
+   * Adjust envMapIntensity and toneMappingExposure until this looks correct.
+   * Then lock the values — do not adjust for the face.
+   */
+  showGraySphere() {
+    this.hideGraySphere();
+
+    const sphereGeo = new THREE.SphereGeometry(0.04, 32, 32);
+    const sphereMat = new THREE.MeshStandardMaterial({
+      color: 0x808080,       // middle gray (sRGB)
+      roughness: 1.0,        // fully matte — pure Lambertian
+      metalness: 0.0,
+      envMapIntensity: this.faceMaterial?.envMapIntensity ?? 1.0,
+    });
+    this._graySphere = new THREE.Mesh(sphereGeo, sphereMat);
+
+    // Position to the left of the face
+    const offset = this._orbitTarget.clone();
+    offset.x -= 0.15;
+    offset.y += 0.05;
+    this._graySphere.position.copy(offset);
+
+    this.scene.add(this._graySphere);
+    console.log('FaceRenderer: Gray sphere shown (0x808080, roughness=1.0)');
+  }
+
+  /** Remove the gray sphere. */
+  hideGraySphere() {
+    if (this._graySphere) {
+      this.scene.remove(this._graySphere);
+      this._graySphere.geometry.dispose();
+      this._graySphere.material.dispose();
+      this._graySphere = null;
+    }
   }
 
   // -----------------------------------------------------------------------

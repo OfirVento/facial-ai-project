@@ -679,12 +679,21 @@ export class PhotoUploader {
     this._debugCoverageMask = coverageCanvas.toDataURL('image/png');
     console.log('PhotoUploader DIAG: UV coverage mask saved to _debugCoverageMask');
 
-    // --- Phase 2: Restore processing pipeline for PBR + HDRI ---
-    // With proper HDRI lighting, delighting removes baked photo shadows
-    // that would otherwise cause double-shadowing with 3D lights.
+    // --- DIAGNOSTIC: Save raw UV rasterization (before any processing) ---
+    {
+      const rawCanvas = document.createElement('canvas');
+      rawCanvas.width = size; rawCanvas.height = size;
+      rawCanvas.getContext('2d').putImageData(
+        new ImageData(new Uint8ClampedArray(outImageData.data), size, size), 0, 0);
+      this._debugPhotoUV_raw = rawCanvas.toDataURL('image/png');
+    }
+
+    // --- Phase 2: Delighting for PBR + HDRI ---
+    // Removes baked photo shadows that would cause double-shadowing with 3D lights.
+    // NOTE: _smoothTextureColors DISABLED per expert review (destroys pore detail → wax look)
     const preAvg = this._computeChannelAverages(outImageData);
     this._delightTexture(outImageData, size);
-    this._smoothTextureColors(outImageData, size);
+    // this._smoothTextureColors(outImageData, size);  // Expert: disabled — kills pores
     this._restoreColorBalance(outImageData, preAvg);
 
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
@@ -700,9 +709,35 @@ export class PhotoUploader {
     preFillCanvas.getContext('2d').putImageData(outImageData, 0, 0);
     this._debugPreFillTexture = preFillCanvas.toDataURL('image/png');
 
+    // --- DIAGNOSTIC: Save alpha coverage mask ---
+    {
+      const alphaCanvas = document.createElement('canvas');
+      alphaCanvas.width = size; alphaCanvas.height = size;
+      const alphaCtx = alphaCanvas.getContext('2d');
+      const alphaData = alphaCtx.createImageData(size, size);
+      for (let i = 0; i < size * size; i++) {
+        const a = outImageData.data[i * 4 + 3];
+        alphaData.data[i * 4] = a;
+        alphaData.data[i * 4 + 1] = a;
+        alphaData.data[i * 4 + 2] = a;
+        alphaData.data[i * 4 + 3] = 255;
+      }
+      alphaCtx.putImageData(alphaData, 0, 0);
+      this._debugAlphaCoverage = alphaCanvas.toDataURL('image/png');
+    }
+
     // --- 6. Mask-normalized Laplacian pyramid blending ---
     // Build full-coverage albedo layer, then blend with photo using 5-level pyramid
     const albedoLayer = this._prepareAlbedoLayer(outImageData, meshGen, size, landmarks, mapping);
+
+    // --- DIAGNOSTIC: Save albedo tinted layer ---
+    {
+      const albCanvas = document.createElement('canvas');
+      albCanvas.width = size; albCanvas.height = size;
+      albCanvas.getContext('2d').putImageData(albedoLayer, 0, 0);
+      this._debugAlbedoTinted = albCanvas.toDataURL('image/png');
+    }
+
     const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
     ctx.putImageData(blendedData, 0, 0);
 

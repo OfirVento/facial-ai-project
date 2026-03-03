@@ -478,7 +478,14 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         // ===== DIAGNOSTIC: Show debug panel with overlays =====
         this._showTextureDebugPanel(this.photoUploader);
 
-        this._addMessage('system', 'Photo texture projected onto 3D model. Debug panel shown below viewport.');
+        // ===== EXPERT DIAGNOSTICS: Quad test + Gray sphere + Texture exports =====
+        if (this.renderer) {
+          this.renderer.showQuadTest();
+          this.renderer.showGraySphere();
+        }
+        this._addExpertDiagButtons(this.photoUploader);
+
+        this._addMessage('system', 'Photo texture projected onto 3D model. Quad test + gray sphere shown for calibration.');
         btn.textContent = '✓ Generated';
         console.log('App: Generation complete');
       } catch (err) {
@@ -860,6 +867,81 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     panel.innerHTML = html;
     document.body.appendChild(panel);
     console.log('PhotoUploader DIAG: Debug panel displayed');
+  }
+
+  // -----------------------------------------------------------------------
+  // EXPERT DIAGNOSTICS: Texture export + Quad/Sphere toggles
+  // -----------------------------------------------------------------------
+
+  _addExpertDiagButtons(uploader) {
+    // Remove existing
+    document.getElementById('expert-diag-panel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'expert-diag-panel';
+    panel.style.cssText = `
+      position:fixed; top:52px; right:10px; z-index:10001;
+      background:#1a1a3a; border:1px solid #444; border-radius:8px;
+      padding:10px; display:flex; flex-direction:column; gap:6px;
+      font-family:'JetBrains Mono',monospace; font-size:11px;
+    `;
+
+    const makeBtn = (label, onClick) => {
+      const btn = document.createElement('button');
+      btn.textContent = label;
+      btn.style.cssText = 'padding:4px 10px;background:#333;color:#0f0;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:11px;font-family:monospace;text-align:left';
+      btn.addEventListener('click', onClick);
+      return btn;
+    };
+
+    // Download helper
+    const downloadDataUrl = (dataUrl, filename) => {
+      const a = document.createElement('a');
+      a.href = dataUrl;
+      a.download = filename;
+      a.click();
+    };
+
+    panel.appendChild(makeBtn('📥 Export: photoUV_raw', () => {
+      if (uploader._debugPhotoUV_raw) downloadDataUrl(uploader._debugPhotoUV_raw, 'photoUV_raw.png');
+      else alert('No raw UV texture available — generate first');
+    }));
+    panel.appendChild(makeBtn('📥 Export: alpha_coverage', () => {
+      if (uploader._debugAlphaCoverage) downloadDataUrl(uploader._debugAlphaCoverage, 'alpha_coverage.png');
+      else alert('No alpha coverage available — generate first');
+    }));
+    panel.appendChild(makeBtn('📥 Export: albedo_tinted', () => {
+      if (uploader._debugAlbedoTinted) downloadDataUrl(uploader._debugAlbedoTinted, 'albedo_tinted.png');
+      else alert('No albedo tinted available — generate first');
+    }));
+    panel.appendChild(makeBtn('📥 Export: photoUV_final', () => {
+      if (uploader._debugFinalTexture) downloadDataUrl(uploader._debugFinalTexture, 'photoUV_final.png');
+      else alert('No final texture available — generate first');
+    }));
+
+    // Separator
+    const sep = document.createElement('div');
+    sep.style.cssText = 'height:1px;background:#444;margin:4px 0';
+    panel.appendChild(sep);
+
+    // Toggle buttons
+    panel.appendChild(makeBtn('🔲 Toggle Quad Test', () => {
+      if (this.renderer?._quadTestMesh) this.renderer.hideQuadTest();
+      else this.renderer?.showQuadTest();
+    }));
+    panel.appendChild(makeBtn('⚪ Toggle Gray Sphere', () => {
+      if (this.renderer?._graySphere) this.renderer.hideGraySphere();
+      else this.renderer?.showGraySphere();
+    }));
+
+    // Close
+    panel.appendChild(makeBtn('✕ Close Diag Panel', () => {
+      panel.remove();
+      this.renderer?.hideQuadTest();
+      this.renderer?.hideGraySphere();
+    }));
+
+    document.body.appendChild(panel);
   }
 
   _addMessage(role, text) {
