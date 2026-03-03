@@ -2418,8 +2418,10 @@ export class PhotoUploader {
     // Use a mild strength factor to avoid over-flattening.
     // Scale by photo brightness: well-lit photos need less delighting (shadows already subtle).
     // Dark photos need more correction. Also adaptive per-pixel for under-eye preservation.
-    const MAX_STRENGTH = 0.2;
-    const lumScale = Math.min(1.0, Math.max(0.3, (180 - avgLum) / 80));
+    // Reduced delighting: with HDRI-only lighting (no direct lights), the photo's
+    // baked shading is less problematic. Over-delighting destroys skin color fidelity.
+    const MAX_STRENGTH = 0.12;
+    const lumScale = Math.min(1.0, Math.max(0.2, (180 - avgLum) / 100));
     const BASE_STRENGTH = MAX_STRENGTH * lumScale;
     console.log(`PhotoUploader DENSE: Delight strength scaled: avgLum=${avgLum.toFixed(1)}, lumScale=${lumScale.toFixed(2)}, BASE_STRENGTH=${BASE_STRENGTH.toFixed(3)}`);
     for (let i = 0; i < total; i++) {
@@ -2458,8 +2460,9 @@ export class PhotoUploader {
     }
     if (postCount > 100) {
       const postAvg = postLumSum / postCount;
-      const brightnessFactor = Math.min(1.4, Math.max(0.8, TARGET_LUM / postAvg));
-      if (Math.abs(brightnessFactor - 1.0) > 0.05) {
+      // Tighter clamp: avoid over-brightening which shifts lighter skin tones
+      const brightnessFactor = Math.min(1.15, Math.max(0.85, TARGET_LUM / postAvg));
+      if (Math.abs(brightnessFactor - 1.0) > 0.03) {
         for (let i = 0; i < total; i++) {
           if (data[i * 4 + 3] === 0) continue;
           data[i * 4]     = Math.min(255, Math.round(data[i * 4] * brightnessFactor));
@@ -3008,6 +3011,10 @@ export class PhotoUploader {
     }
 
     // --- Blend each Laplacian level using mask at that level ---
+    // CRITICAL FIX: Sharpen mask at coarse levels to prevent FLAME albedo
+    // color bleeding INTO the photo region through low-frequency bands.
+    // At fine levels (l=0,1) use soft mask for smooth edges.
+    // At coarse levels (l=2,3,4) sharpen mask to keep photo color dominant.
     const blendedLap = [];
     for (let l = 0; l < levels; l++) {
       const pL = photoLap[l];
@@ -3015,27 +3022,32 @@ export class PhotoUploader {
       const mL = maskGauss[l];
       const blended = new Float32Array(pL.data.length);
       const pw = pL.w;
+      // Sharpen mask more at coarser levels: pow(mask, 1) at l=0, pow(mask, 2) at l=2, etc.
+      const sharpPow = l <= 1 ? 1.0 : (1.0 + (l - 1) * 0.8);
       for (let y = 0; y < pL.h; y++) {
         for (let x = 0; x < pw; x++) {
-          const mi = mL.data[y * pw + x]; // mask at this level
-          const t = Math.max(0, Math.min(1, mi)); // clamp
+          let mi = Math.max(0, Math.min(1, mL.data[y * pw + x]));
+          // Sharpen: push mask toward 0 or 1 at coarser levels
+          mi = Math.pow(mi, 1.0 / sharpPow);
           for (let c = 0; c < ch; c++) {
             const idx = (y * pw + x) * ch + c;
-            blended[idx] = t * pL.data[idx] + (1 - t) * aL.data[idx];
+            blended[idx] = mi * pL.data[idx] + (1 - mi) * aL.data[idx];
           }
         }
       }
       blendedLap.push({ data: blended, w: pw, h: pL.h });
     }
 
-    // Blend coarsest Gaussian level too
+    // Blend coarsest Gaussian level — use sharper mask to prevent tint bleed
     const pCoarse = photoGauss[levels];
     const aCoarse = albedoGauss[levels];
     const mCoarse = maskGauss[levels];
     const blendedCoarse = new Float32Array(pCoarse.data.length);
     for (let y = 0; y < pCoarse.h; y++) {
       for (let x = 0; x < pCoarse.w; x++) {
-        const t = Math.max(0, Math.min(1, mCoarse.data[y * pCoarse.w + x]));
+        let t = Math.max(0, Math.min(1, mCoarse.data[y * pCoarse.w + x]));
+        // At coarsest level, strongly prefer photo to prevent overall color shift
+        t = Math.pow(t, 0.3); // Push any masked area toward photo
         for (let c = 0; c < ch; c++) {
           const idx = (y * pCoarse.w + x) * ch + c;
           blendedCoarse[idx] = t * pCoarse.data[idx] + (1 - t) * aCoarse.data[idx];
