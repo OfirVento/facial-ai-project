@@ -464,52 +464,53 @@ export class FaceRenderer {
     if (mat.map) { mat.map = null; }
 
     // Expert round 3: disable normal map in hybrid mode.
-    // Current normalMap is from raw image-space photo (doesn't match UV texture).
-    // Will reintroduce once computed from UV-space texture + masked to photo regions.
     if (mat.normalMap) {
       mat.normalMap.dispose();
       mat.normalMap = null;
     }
 
-    // Photo → emissive: bypasses BRDF 1/π, shown at full brightness
+    // ---- EMISSIVE-ONLY: photo shown at full fidelity ----
+    // Photo → emissiveMap bypasses BRDF 1/π, shown at full brightness.
+    // The photo already contains baked lighting from the camera.
     mat.emissiveMap = texture;
     mat.emissive.set(0xffffff);
     mat.emissiveIntensity = 1.0;
 
-    // Kill Lambertian diffuse entirely (photo already has baked lighting)
-    mat.color.set(0x000000);
-
-    // Expert: high roughness to avoid plastic wrap (photo already has baked highlights,
-    // HDRI specular adds a second highlight on top → double specular = plastic look)
-    mat.roughness = 0.88;           // 0.85-0.9 range per expert
+    // Kill ALL other shading channels — photo is the sole visual
+    mat.color.set(0x000000);          // No Lambertian diffuse
+    mat.roughness = 1.0;              // Fully rough (no specular lobe)
     mat.metalness = 0.0;
-    mat.sheen = 0.0;                // No cloth fuzz
-    mat.clearcoat = 0.0;            // No car-paint specular
+    mat.sheen = 0.0;
+    mat.clearcoat = 0.0;
     mat.transmission = 0;
     mat.thickness = 0;
 
-    // Tone mapping ON — ACES is gentle on emissive values in 0-1 range
-    mat.toneMapped = true;
-    // Minimal HDRI specular: trust photo's baked lighting for face,
-    // HDRI only gives tiny sense of volume + lights fallback albedo regions
-    mat.envMapIntensity = 0.02;
+    // ---- KILL SPECULAR COMPLETELY ----
+    // Root cause of "plastic layer": even envMapIntensity=0.02 combined with
+    // HDR peak brightness (studio lights at 50-100x) + Fresnel at grazing angles
+    // creates a visible glossy film over the entire face.
+    // High roughness (0.88) just SPREADS the specular into a uniform sheen
+    // rather than eliminating it — making it worse (plastic wrap effect).
+    // Fix: zero out ALL specular pathways.
+    mat.envMapIntensity = 0;           // No HDRI reflections at all
+    mat.specularIntensity = 0;         // Kill Fresnel/F0 BRDF lobe
+    mat.reflectivity = 0;              // Belt-and-suspenders: zero reflectivity
+
+    mat.toneMapped = false;            // Skip tone mapping entirely
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
 
-    // All direct lights OFF — HDRI provides specular only
+    // All direct lights OFF
     this._setPhotoLighting();
 
-    // Expert round 4: switch to NoToneMapping for hybrid mode.
-    // ACES desaturates/compresses emissive photo content → "processed" look.
-    // With envMapIntensity=0.02, specular values are tiny and won't clip.
-    // Keep ACES for PBR mode where it's needed for HDR highlights.
+    // No tone mapping for hybrid — photo values pass through as-is
     if (this.renderer) {
       this.renderer.toneMapping = THREE.NoToneMapping;
       this.renderer.toneMappingExposure = 1.0;
     }
 
-    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.02, roughness=0.88, NoToneMapping)');
+    console.log('FaceRenderer: Hybrid photo mode (emissive-only, zero specular, NoToneMapping)');
   }
 
   /**

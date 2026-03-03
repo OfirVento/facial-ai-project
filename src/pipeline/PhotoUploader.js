@@ -392,7 +392,7 @@ export class PhotoUploader {
 
     return {
       canvas,
-      dataUrl: canvas.toDataURL('image/jpeg', 0.92),
+      dataUrl: canvas.toDataURL('image/png'),
       width: size,
       height: size
     };
@@ -829,7 +829,7 @@ export class PhotoUploader {
 
     return {
       canvas,
-      dataUrl: canvas.toDataURL('image/jpeg', 0.92),
+      dataUrl: canvas.toDataURL('image/png'),
       width: size,
       height: size
     };
@@ -1282,7 +1282,7 @@ export class PhotoUploader {
 
     return {
       canvas,
-      dataUrl: canvas.toDataURL('image/jpeg', 0.92),
+      dataUrl: canvas.toDataURL('image/png'),
       width: size,
       height: size
     };
