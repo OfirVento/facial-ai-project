@@ -248,29 +248,25 @@ export class FaceRenderer {
     const hasHDRI = this.scene && this.scene.environment;
 
     if (hasHDRI) {
-      // Expert calibration: HDRI provides primary illumination.
-      // Direct lights add subtle fill only — don't double-light the photo.
-      // Values calibrated with 0.18 gray sphere.
+      // Gray-sphere calibrated: HDRI is the SOLE light source in photo mode.
+      // All direct lights OFF — any additional light doubles the illumination
+      // and washes out the photo texture (confirmed by gray sphere test).
       if (this.lights.key) {
-        this.lights.key.intensity = 0.2;
-        this.lights.key.color.set(0xffffff);
-        this.lights.key.castShadow = false;
+        this.lights.key.intensity = 0.0;
       }
       if (this.lights.fill) {
-        this.lights.fill.intensity = 0.1;
-        this.lights.fill.color.set(0xffffff);
+        this.lights.fill.intensity = 0.0;
       }
       if (this.lights.rim) {
-        this.lights.rim.intensity = 0.08;
+        this.lights.rim.intensity = 0.0;
       }
       if (this.lights.ambient) {
-        this.lights.ambient.intensity = 0.0;       // HDRI provides ambient — no double-up
-        this.lights.ambient.color.set(0xffffff);
+        this.lights.ambient.intensity = 0.0;
       }
       if (this.lights.rectArea) {
-        this.lights.rectArea.intensity = 0.0;      // HDRI replaces softbox
+        this.lights.rectArea.intensity = 0.0;
       }
-      console.log('FaceRenderer: Photo lighting (HDRI-calibrated)');
+      console.log('FaceRenderer: Photo lighting (HDRI-only, all direct lights OFF)');
     } else {
       // Fallback: no HDRI — use nearly flat lighting (Phase 10 legacy)
       if (this.lights.key) {
@@ -405,12 +401,13 @@ export class FaceRenderer {
     // Adjust lighting for HDRI photo mode
     this._setPhotoLighting();
 
-    // Keep exposure at 1.0 — ACES handles it fine with reduced env intensity
+    // Gray-sphere calibrated exposure: ACES filmic at 1.0 over-exposes with
+    // studio HDRI. 0.55 makes 0x808080 sphere render as middle gray.
     if (this.renderer) {
-      this.renderer.toneMappingExposure = 1.0;
+      this.renderer.toneMappingExposure = 0.55;
     }
 
-    console.log('FaceRenderer: PBR photo mode (HDRI=0.3, roughness=0.75)');
+    console.log('FaceRenderer: PBR photo mode (envMap=1.0, exposure=0.55, roughness=0.65)');
   }
 
   /**

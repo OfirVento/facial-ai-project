@@ -478,14 +478,10 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         // ===== DIAGNOSTIC: Show debug panel with overlays =====
         this._showTextureDebugPanel(this.photoUploader);
 
-        // ===== EXPERT DIAGNOSTICS: Quad test + Gray sphere + Texture exports =====
-        if (this.renderer) {
-          this.renderer.showQuadTest();
-          this.renderer.showGraySphere();
-        }
+        // Expert diagnostics: toggle buttons available but NOT auto-shown
         this._addExpertDiagButtons(this.photoUploader);
 
-        this._addMessage('system', 'Photo texture projected onto 3D model. Quad test + gray sphere shown for calibration.');
+        this._addMessage('system', 'Photo texture projected onto 3D model.');
         btn.textContent = '✓ Generated';
         console.log('App: Generation complete');
       } catch (err) {
