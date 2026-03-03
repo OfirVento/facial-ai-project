@@ -645,40 +645,72 @@ export class PhotoUploader {
     const od = outImageData.data;
     const N = size * size;
 
-    // Weighted accumulation buffers
-    const accumR = new Float32Array(N);
-    const accumG = new Float32Array(N);
-    const accumB = new Float32Array(N);
-    const accumW = new Float32Array(N); // total weight per pixel
+    // --- Front-priority accumulation ---
+    // Front view is the "hero" — it has the best alignment (shape/expression
+    // were fitted to it). Side views should only fill where the front view
+    // has poor or no coverage. This prevents forehead patch artifacts from
+    // side view misalignment in the central face region.
+    //
+    // Strategy: front view gets a large weight boost (FRONT_BOOST).
+    // Side views only contribute meaningfully where front confidence is low.
+    const FRONT_BOOST = 4.0;  // Front view weight multiplier
+    const SIDE_SUPPRESS_THRESHOLD = 0.5; // If front N·V > this, suppress side views
 
-    for (const proj of viewProjections) {
-      const pd = proj.imageData.data;
-      const conf = proj.confidence; // Float32Array[N] — per-pixel N·V confidence
+    const frontProj = viewProjections[0];
+    const frontData = frontProj.imageData.data;
+    const frontConf = frontProj.confidence;
 
-      for (let i = 0; i < N; i++) {
-        if (pd[i * 4 + 3] === 0) continue; // No data from this view
-        const w = conf[i];
-        if (w <= 0) continue;
-
-        accumR[i] += pd[i * 4] * w;
-        accumG[i] += pd[i * 4 + 1] * w;
-        accumB[i] += pd[i * 4 + 2] * w;
-        accumW[i] += w;
-      }
-    }
-
-    // Write accumulated result
+    // First pass: write front view everywhere it has data
     let totalMapped = 0;
     for (let i = 0; i < N; i++) {
-      if (accumW[i] > 0) {
-        od[i * 4]     = Math.round(accumR[i] / accumW[i]);
-        od[i * 4 + 1] = Math.round(accumG[i] / accumW[i]);
-        od[i * 4 + 2] = Math.round(accumB[i] / accumW[i]);
-        od[i * 4 + 3] = 255;
-        totalMapped++;
+      if (frontData[i * 4 + 3] === 0) continue;
+      const w = frontConf[i];
+      if (w <= 0) continue;
+      od[i * 4]     = frontData[i * 4];
+      od[i * 4 + 1] = frontData[i * 4 + 1];
+      od[i * 4 + 2] = frontData[i * 4 + 2];
+      od[i * 4 + 3] = 255;
+      totalMapped++;
+    }
+
+    // Second pass: blend in side views where front is weak or absent
+    let sideContributions = 0;
+    for (let v = 1; v < viewProjections.length; v++) {
+      const sideProj = viewProjections[v];
+      const sd = sideProj.imageData.data;
+      const sc = sideProj.confidence;
+
+      for (let i = 0; i < N; i++) {
+        if (sd[i * 4 + 3] === 0) continue;
+        const sideW = sc[i];
+        if (sideW <= 0) continue;
+
+        const frontW = frontConf[i] * FRONT_BOOST;
+
+        if (frontData[i * 4 + 3] === 0 || frontConf[i] <= 0) {
+          // Front has NO data here — side view fills in entirely
+          od[i * 4]     = sd[i * 4];
+          od[i * 4 + 1] = sd[i * 4 + 1];
+          od[i * 4 + 2] = sd[i * 4 + 2];
+          od[i * 4 + 3] = 255;
+          totalMapped++;
+          sideContributions++;
+        } else if (frontConf[i] < SIDE_SUPPRESS_THRESHOLD) {
+          // Front has weak coverage — blend side view in proportionally
+          // Lower front confidence → more side contribution
+          const totalW = frontW + sideW;
+          const frontBlend = frontW / totalW;
+          const sideBlend = sideW / totalW;
+
+          od[i * 4]     = Math.round(od[i * 4] * frontBlend + sd[i * 4] * sideBlend);
+          od[i * 4 + 1] = Math.round(od[i * 4 + 1] * frontBlend + sd[i * 4 + 1] * sideBlend);
+          od[i * 4 + 2] = Math.round(od[i * 4 + 2] * frontBlend + sd[i * 4 + 2] * sideBlend);
+          sideContributions++;
+        }
+        // else: front has strong coverage — ignore side view entirely
       }
     }
-    console.log(`PhotoUploader MULTI: Accumulated ${totalMapped}/${N} pixels from ${viewProjections.length} views`);
+    console.log(`PhotoUploader MULTI: Accumulated ${totalMapped}/${N} pixels, side views contributed to ${sideContributions} pixels`);
 
     // --- Color harmonization: match side views' brightness to front ---
     // Front view is "hero" — side views may have different lighting
