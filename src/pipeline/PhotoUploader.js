@@ -700,11 +700,15 @@ export class PhotoUploader {
     // this._smoothTextureColors(outImageData, size);  // Expert: disabled — kills pores
     this._restoreColorBalance(outImageData, preAvg);
 
-    // --- 5c. Soften alpha boundaries for smooth blending transitions ---
+    // --- 5c-i. Expert: erode alpha inward before softening ---
+    // Forces the blend band to live entirely in "safe skin pixels" and avoids
+    // pulling in boundary contamination (hair, background, ear edge).
+    const ERODE_PX = Math.max(8, Math.round(size / 160));  // ~12px at 2048
+    this._erodeAlpha(outImageData, size, ERODE_PX);
+
+    // --- 5c-ii. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    // Hybrid mode: wider radius (~85px at 2048) for smoother forehead/scalp transition
-    // PBR mode: narrower (~64px) since delighting flattens brightness differences
     const renderMode = this._renderModeHint || 'hybrid';
     const softenRadius = renderMode === 'hybrid'
       ? Math.max(24, Math.round(size / 24))    // ~85px at 2048
@@ -1661,14 +1665,15 @@ export class PhotoUploader {
       const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
       const cosAngle = nLen > 1e-10 ? dot / nLen : 0;
 
-      // Strict visibility: expert-mandated dot(N,V) < 0.2 → reject
-      // Tighter than Phase 8 (was 0.05-0.25) to prevent inverted silhouette triangles
-      if (cosAngle > 0.3) {
+      // Expert N·V grazing-angle cull: reject N·V < 0.35
+      // Grazing triangles sample a tiny area and stretch it across a large surface
+      // → "melted cheek/jaw". Let tinted FLAME albedo fill these regions instead.
+      if (cosAngle > 0.45) {
         visibility[f] = 1.0;
         visibleCount++;
-      } else if (cosAngle > 0.2) {
-        // Narrow fade zone (0.2-0.3) — sharp cutoff at silhouette
-        visibility[f] = (cosAngle - 0.2) / 0.10;
+      } else if (cosAngle > 0.35) {
+        // Narrow fade zone (0.35-0.45) for smooth transition
+        visibility[f] = (cosAngle - 0.35) / 0.10;
         visibleCount++;
       } else {
         // Below 0.2 — reject (grazing/back-facing, causes swirl artifacts)
@@ -2287,8 +2292,99 @@ export class PhotoUploader {
   }
 
   /**
-   * Remove baked-in photo shading from the texture (Tier A delighting).
+   * Erode alpha mask inward by `radius` pixels.
+   * Any pixel whose alpha > 0 that is within `radius` of an alpha=0 pixel
+   * gets zeroed out. This shrinks the photo coverage boundary inward so the
+   * subsequent softening blur lives entirely in safe, well-mapped skin pixels
+   * instead of pulling in hair/background/ear-edge contamination.
    *
+   * Uses a distance-field approach: compute min distance to any alpha=0 pixel,
+   * then zero out everything within `radius`.
+   */
+  _erodeAlpha(imageData, size, radius = 12) {
+    const data = imageData.data;
+    const N = size * size;
+
+    // Extract binary mask: 1 = has alpha, 0 = transparent
+    const mask = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      mask[i] = data[i * 4 + 3] > 0 ? 1 : 0;
+    }
+
+    // Two-pass approximate distance to nearest zero-alpha pixel
+    // using a separable min-filter (erosion by square structuring element).
+    // For each row, find min distance to a 0-pixel within `radius` columns.
+    // Then for each column, find min across rows.
+    // A pixel is eroded if it's within `radius` of a boundary.
+
+    // Pass 1: For each pixel, determine if any neighbor within `radius`
+    // in horizontal direction is transparent
+    const hDist = new Int16Array(N); // horizontal distance to nearest 0
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      // Forward pass: distance from left
+      let dist = radius + 1;
+      for (let x = 0; x < size; x++) {
+        if (mask[row + x] === 0) {
+          dist = 0;
+        } else {
+          dist++;
+        }
+        hDist[row + x] = dist;
+      }
+      // Backward pass: distance from right
+      dist = radius + 1;
+      for (let x = size - 1; x >= 0; x--) {
+        if (mask[row + x] === 0) {
+          dist = 0;
+        } else {
+          dist++;
+        }
+        hDist[row + x] = Math.min(hDist[row + x], dist);
+      }
+    }
+
+    // Pass 2: Vertical pass using Chebyshev distance (square erosion)
+    // For each pixel, check if any pixel within `radius` rows has hDist <= radius
+    const eroded = new Uint8Array(N); // 1 = should be eroded (zeroed)
+    const vTemp = new Int16Array(size); // column buffer
+    for (let x = 0; x < size; x++) {
+      // Extract column of hDist
+      for (let y = 0; y < size; y++) {
+        vTemp[y] = hDist[y * size + x];
+      }
+      // For each pixel in this column, find min hDist within ±radius rows
+      // Use sliding window min
+      // Simple approach: for each y, scan ±radius
+      for (let y = 0; y < size; y++) {
+        if (mask[y * size + x] === 0) continue; // already transparent
+        let minH = vTemp[y];
+        const yStart = Math.max(0, y - radius);
+        const yEnd = Math.min(size - 1, y + radius);
+        for (let yy = yStart; yy <= yEnd; yy++) {
+          if (vTemp[yy] < minH) minH = vTemp[yy];
+          if (minH === 0) break; // can't get lower
+        }
+        // If the nearest transparent pixel (Chebyshev) is within radius, erode
+        if (minH <= radius) {
+          eroded[y * size + x] = 1;
+        }
+      }
+    }
+
+    // Apply erosion
+    let erodedCount = 0;
+    for (let i = 0; i < N; i++) {
+      if (eroded[i] && mask[i]) {
+        data[i * 4 + 3] = 0;
+        erodedCount++;
+      }
+    }
+
+    console.log(`PhotoUploader DENSE: Alpha erosion: ${erodedCount} pixels eroded (radius=${radius})`);
+  }
+
+  /**
    * Soften alpha boundaries for smooth blending transitions.
    * Applies a box blur to just the alpha channel, creating gradual
    * photo-to-albedo transitions at face edges, visibility fades, etc.

@@ -470,8 +470,9 @@ export class FaceRenderer {
     // Kill Lambertian diffuse entirely (photo already has baked lighting)
     mat.color.set(0x000000);
 
-    // Expert: start conservative — roughness 0.7, envMap low (0.05-0.12)
-    mat.roughness = 0.70;           // Higher = less plastic
+    // Expert: high roughness to avoid plastic wrap (photo already has baked highlights,
+    // HDRI specular adds a second highlight on top → double specular = plastic look)
+    mat.roughness = 0.88;           // 0.85-0.9 range per expert
     mat.metalness = 0.0;
     mat.sheen = 0.0;                // No cloth fuzz
     mat.clearcoat = 0.0;            // No car-paint specular
@@ -480,9 +481,9 @@ export class FaceRenderer {
 
     // Tone mapping ON — ACES is gentle on emissive values in 0-1 range
     mat.toneMapped = true;
-    // Subtle HDRI specular: with color=black, only specular lobe responds
-    // Reduced from 0.08 → 0.04 to minimize visible shiny patches on forehead/nose
-    mat.envMapIntensity = 0.04;
+    // Minimal HDRI specular: trust photo's baked lighting for face,
+    // HDRI only gives tiny sense of volume + lights fallback albedo regions
+    mat.envMapIntensity = 0.02;
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
@@ -495,7 +496,7 @@ export class FaceRenderer {
       this.renderer.toneMappingExposure = 1.0;
     }
 
-    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.04, roughness=0.7)');
+    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.02, roughness=0.88)');
   }
 
   /**
