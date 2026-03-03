@@ -455,8 +455,14 @@ You can now modify specific regions — try saying "make my nose thinner" or use
           }
         }
 
-        btn.textContent = 'Detecting face...';
-        console.log('App: Calling generateTextureFromPhoto...');
+        // Show multi-view status if side photos available
+        const status = this.photoUploader.getStatus();
+        if (status.photoCount > 1) {
+          btn.textContent = `Processing ${status.photoCount} views...`;
+        } else {
+          btn.textContent = 'Detecting face...';
+        }
+        console.log(`App: Calling generateTextureFromPhoto (${status.photoCount} view(s))...`);
 
         // Generate texture from photo — pass render mode for delighting adjustment
         const renderMode = this.renderer?._photoRenderMode || 'hybrid';

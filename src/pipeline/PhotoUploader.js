@@ -211,6 +211,21 @@ export class PhotoUploader {
       console.error('PhotoUploader: Camera estimation failed on fitted mesh!');
     }
 
+    // Check for multi-view: if left45 or right45 photos exist, use multi-view pipeline
+    const hasMultiView = this.photos.left45 || this.photos.right45;
+
+    if (hasMultiView) {
+      console.log('PhotoUploader: Multi-view photos detected, using multi-view pipeline');
+      const result = await this._multiViewProjectTextureToUV(
+        img, landmarks, mapping, meshGen, fittedCamera, bridge
+      );
+      if (result) {
+        console.log('PhotoUploader: Multi-view projection succeeded');
+        return result;
+      }
+      console.warn('PhotoUploader: Multi-view failed, falling back to single front view');
+    }
+
     // Dense Projection (camera-based texture baking) — uses the SAME camera as fitting
     const result = this._denseProjectTextureToUV(img, landmarks, mapping, meshGen, fittedCamera);
     if (result) {
@@ -529,6 +544,441 @@ export class PhotoUploader {
     ctx.fillText('↓ +V', size / 2 + 20, size - 80);
 
     return canvas.toDataURL('image/png');
+  }
+
+  // -----------------------------------------------------------------------
+  // Multi-View Projection Pipeline
+  // -----------------------------------------------------------------------
+
+  /**
+   * Multi-view texture projection: accumulates UV projections from front +
+   * left45 + right45 views with N·V confidence weighting.
+   *
+   * Each view is projected independently, then merged:
+   * - Per-pixel confidence = face visibility (N·V) from that view's camera
+   * - Overlapping regions: weighted average by confidence
+   * - Non-overlapping regions: single view fills in
+   * - Post-processing (erosion, softening, Laplacian blend) applied once
+   */
+  async _multiViewProjectTextureToUV(frontImg, frontLandmarks, mapping, meshGen, frontCamera, bridge) {
+    const size = 2048;
+    const uvCoords = meshGen.flameUVCoords;
+    const uvFaces = meshGen.flameUVFaces;
+
+    // Collect all available views
+    const views = [];
+
+    // Front view (already detected + fitted)
+    views.push({
+      label: 'front',
+      img: frontImg,
+      landmarks: frontLandmarks,
+      camera: frontCamera,
+    });
+
+    // Side views: detect landmarks and estimate camera for each
+    for (const angle of ['left45', 'right45']) {
+      if (!this.photos[angle]) continue;
+
+      try {
+        const sideImg = new Image();
+        sideImg.crossOrigin = 'anonymous';
+        await new Promise((resolve, reject) => {
+          sideImg.onload = resolve;
+          sideImg.onerror = reject;
+          sideImg.src = this.photos[angle].url;
+        });
+
+        const sideLandmarks = await bridge.detectFromImage(sideImg);
+        if (!sideLandmarks || sideLandmarks.length < 468) {
+          console.warn(`PhotoUploader MULTI: No face detected in ${angle} photo, skipping`);
+          continue;
+        }
+
+        // Estimate camera from the SAME fitted mesh (shape/expression from front)
+        const sideCamera = this._estimateCameraFromLandmarks(sideLandmarks, mapping, meshGen);
+        if (!sideCamera) {
+          console.warn(`PhotoUploader MULTI: Camera estimation failed for ${angle}, skipping`);
+          continue;
+        }
+
+        console.log(`PhotoUploader MULTI: ${angle} camera: sx=${sideCamera.sx.toFixed(4)}, sy=${sideCamera.sy.toFixed(4)}`);
+        views.push({
+          label: angle,
+          img: sideImg,
+          landmarks: sideLandmarks,
+          camera: sideCamera,
+        });
+      } catch (err) {
+        console.warn(`PhotoUploader MULTI: Error processing ${angle}:`, err.message);
+      }
+    }
+
+    console.log(`PhotoUploader MULTI: Processing ${views.length} view(s): ${views.map(v => v.label).join(', ')}`);
+
+    if (views.length < 2) {
+      console.warn('PhotoUploader MULTI: Only 1 view available, falling back to single-view');
+      return null; // Let caller fall back to single-view pipeline
+    }
+
+    // --- Project each view to UV space ---
+    const viewProjections = [];
+    for (const view of views) {
+      const proj = this._projectViewToUVRaw(view.img, view.landmarks, mapping, meshGen, view.camera, size);
+      if (proj) {
+        viewProjections.push({ ...view, ...proj });
+        console.log(`PhotoUploader MULTI: ${view.label} projected (${proj.mappedPixels} mapped pixels)`);
+      }
+    }
+
+    if (viewProjections.length < 2) {
+      console.warn('PhotoUploader MULTI: Less than 2 successful projections, falling back');
+      return null;
+    }
+
+    // --- Accumulate views with N·V confidence weighting ---
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const outImageData = ctx.createImageData(size, size);
+    const od = outImageData.data;
+    const N = size * size;
+
+    // Weighted accumulation buffers
+    const accumR = new Float32Array(N);
+    const accumG = new Float32Array(N);
+    const accumB = new Float32Array(N);
+    const accumW = new Float32Array(N); // total weight per pixel
+
+    for (const proj of viewProjections) {
+      const pd = proj.imageData.data;
+      const conf = proj.confidence; // Float32Array[N] — per-pixel N·V confidence
+
+      for (let i = 0; i < N; i++) {
+        if (pd[i * 4 + 3] === 0) continue; // No data from this view
+        const w = conf[i];
+        if (w <= 0) continue;
+
+        accumR[i] += pd[i * 4] * w;
+        accumG[i] += pd[i * 4 + 1] * w;
+        accumB[i] += pd[i * 4 + 2] * w;
+        accumW[i] += w;
+      }
+    }
+
+    // Write accumulated result
+    let totalMapped = 0;
+    for (let i = 0; i < N; i++) {
+      if (accumW[i] > 0) {
+        od[i * 4]     = Math.round(accumR[i] / accumW[i]);
+        od[i * 4 + 1] = Math.round(accumG[i] / accumW[i]);
+        od[i * 4 + 2] = Math.round(accumB[i] / accumW[i]);
+        od[i * 4 + 3] = 255;
+        totalMapped++;
+      }
+    }
+    console.log(`PhotoUploader MULTI: Accumulated ${totalMapped}/${N} pixels from ${viewProjections.length} views`);
+
+    // --- Color harmonization: match side views' brightness to front ---
+    // Front view is "hero" — side views may have different lighting
+    this._harmonizeMultiViewColors(outImageData, viewProjections, size);
+
+    // --- Store diagnostic data for overlays ---
+    this._diagCameraParams = frontCamera;
+    this._diagFaceVisibility = viewProjections[0].faceVisibility;
+    this._diagProjectedCoords = viewProjections[0].projectedCoords;
+    this._diagMeshGen = meshGen;
+    this._lastDebugData = viewProjections[0].debugData;
+
+    // --- Apply UV mask ---
+    const uvMask = this._buildUVMask(size, uvCoords, uvFaces);
+    this._applyUVMask(outImageData, size, uvMask);
+
+    // --- Edge dilation ---
+    const preDilationAlpha = new Uint8Array(N);
+    for (let i = 0; i < N; i++) preDilationAlpha[i] = outImageData.data[i * 4 + 3] > 0 ? 1 : 0;
+    this._dilateEdges(outImageData, size, 80);
+    this._blurDilatedBand(outImageData, size, preDilationAlpha);
+
+    // --- Eye socket feathering (use front landmarks) ---
+    this._featherEyeSockets(outImageData, size, frontLandmarks, mapping, uvCoords, uvFaces);
+
+    // --- Diagnostic coverage ---
+    let mappedPixels = 0;
+    for (let i = 0; i < N; i++) {
+      if (outImageData.data[i * 4 + 3] > 0) mappedPixels++;
+    }
+    console.log(`PhotoUploader MULTI: ${mappedPixels}/${N} pixels mapped (${(mappedPixels / N * 100).toFixed(1)}%) after dilation`);
+
+    // --- Save raw UV texture debug ---
+    {
+      const rawCanvas = document.createElement('canvas');
+      rawCanvas.width = size; rawCanvas.height = size;
+      rawCanvas.getContext('2d').putImageData(
+        new ImageData(new Uint8ClampedArray(outImageData.data), size, size), 0, 0);
+      this._debugPhotoUV_raw = rawCanvas.toDataURL('image/png');
+    }
+
+    // --- Delighting ---
+    const preAvg = this._computeChannelAverages(outImageData);
+    this._delightTexture(outImageData, size);
+    this._restoreColorBalance(outImageData, preAvg);
+
+    // --- Alpha erosion + softening ---
+    const preErosionAlpha = new Uint8Array(N);
+    for (let i = 0; i < N; i++) preErosionAlpha[i] = outImageData.data[i * 4 + 3];
+    this._diagPreErosionAlpha = preErosionAlpha;
+    this._diagTextureSize = size;
+
+    const ERODE_PX = Math.max(8, Math.round(size / 160));
+    this._erodeAlpha(outImageData, size, ERODE_PX);
+    const FOREHEAD_EXTRA_ERODE = Math.max(8, Math.round(size / 160));
+    this._erodeAlphaRegion(outImageData, size, FOREHEAD_EXTRA_ERODE, 0.60, 1.0);
+
+    const renderMode = this._renderModeHint || 'hybrid';
+    const softenRadius = renderMode === 'hybrid'
+      ? Math.max(24, Math.round(size / 24)) : Math.max(16, Math.round(size / 32));
+    const foreheadSoftenRadius = renderMode === 'hybrid'
+      ? Math.max(40, Math.round(size / 16)) : softenRadius;
+    this._softenAlphaBoundaryRegional(outImageData, size, softenRadius, foreheadSoftenRadius, 0.60);
+
+    // --- Save alpha coverage debug ---
+    {
+      const alphaCanvas = document.createElement('canvas');
+      alphaCanvas.width = size; alphaCanvas.height = size;
+      const alphaCtx = alphaCanvas.getContext('2d');
+      const alphaData = alphaCtx.createImageData(size, size);
+      for (let i = 0; i < N; i++) {
+        const a = outImageData.data[i * 4 + 3];
+        alphaData.data[i * 4] = a; alphaData.data[i * 4 + 1] = a;
+        alphaData.data[i * 4 + 2] = a; alphaData.data[i * 4 + 3] = 255;
+      }
+      alphaCtx.putImageData(alphaData, 0, 0);
+      this._debugAlphaCoverage = alphaCanvas.toDataURL('image/png');
+    }
+
+    // --- Laplacian blend with albedo ---
+    const albedoLayer = this._prepareAlbedoLayer(outImageData, meshGen, size, frontLandmarks, mapping);
+    {
+      const albCanvas = document.createElement('canvas');
+      albCanvas.width = size; albCanvas.height = size;
+      albCanvas.getContext('2d').putImageData(albedoLayer, 0, 0);
+      this._debugAlbedoTinted = albCanvas.toDataURL('image/png');
+    }
+
+    const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
+    this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
+    this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
+
+    ctx.putImageData(blendedData, 0, 0);
+    console.log('PhotoUploader MULTI: Multi-view projection complete');
+    this._debugFinalTexture = canvas.toDataURL('image/png');
+
+    return {
+      canvas,
+      dataUrl: canvas.toDataURL('image/jpeg', 0.92),
+      width: size,
+      height: size
+    };
+  }
+
+  /**
+   * Project a single view to UV space, returning raw imageData + per-pixel
+   * confidence (N·V). Used by multi-view accumulation pipeline.
+   *
+   * Returns: { imageData, confidence, faceVisibility, projectedCoords, mappedPixels, debugData }
+   */
+  _projectViewToUVRaw(img, landmarks, mapping, meshGen, camera, size) {
+    const uvCoords = meshGen.flameUVCoords;
+    const uvFaces = meshGen.flameUVFaces;
+
+    // Source image
+    const maxSrc = 2048;
+    const sc = Math.min(1, maxSrc / Math.max(img.naturalWidth, img.naturalHeight));
+    const srcW = Math.round(img.naturalWidth * sc);
+    const srcH = Math.round(img.naturalHeight * sc);
+    const srcCanvas = document.createElement('canvas');
+    srcCanvas.width = srcW; srcCanvas.height = srcH;
+    srcCanvas.getContext('2d').drawImage(img, 0, 0, srcW, srcH);
+    const srcData = srcCanvas.getContext('2d').getImageData(0, 0, srcW, srcH).data;
+
+    // Project vertices
+    const { coords: projectedCoords, depths: vertexDepths } = this._projectAllVertices(meshGen, camera);
+
+    // Face visibility (N·V)
+    const faceVisibility = this._computeFaceVisibility(meshGen, camera);
+
+    // Map to UV
+    const uvImgCoords = this._mapProjectionToUV(projectedCoords, meshGen, faceVisibility);
+
+    // Compute UV depths for z-buffering
+    const mpIndices = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords = mapping.lmk_b_coords;
+
+    // Build debug data (UV control points for front view)
+    const ctrlU = [], ctrlV = [], ctrlIX = [], ctrlIY = [];
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (mpIdx >= landmarks.length) continue;
+      const lm = landmarks[mpIdx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+      ctrlIX.push(lm.x); ctrlIY.push(lm.y);
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const uvi0 = uvFaces[fi * 3], uvi1 = uvFaces[fi * 3 + 1], uvi2 = uvFaces[fi * 3 + 2];
+      const u = bc[0] * uvCoords[uvi0 * 2] + bc[1] * uvCoords[uvi1 * 2] + bc[2] * uvCoords[uvi2 * 2];
+      const v = bc[0] * uvCoords[uvi0 * 2 + 1] + bc[1] * uvCoords[uvi1 * 2 + 1] + bc[2] * uvCoords[uvi2 * 2 + 1];
+      ctrlU.push(u); ctrlV.push(v);
+    }
+
+    // UV depths
+    const nUVVerts = uvCoords.length / 2;
+    const uvDepths = new Float32Array(nUVVerts);
+
+    // Excluded faces + boundary mask
+    const excludedFaces = this._buildInnerMouthMask(meshGen);
+    const faceBoundaryMask = this._buildFaceBoundaryMask(landmarks, srcW, srcH);
+
+    // Rasterize
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = size; tempCanvas.height = size;
+    const imageData = tempCanvas.getContext('2d').createImageData(size, size);
+    const expectedWindingSign = Math.sign(camera.sx * camera.sy);
+    this._rasterizeMeshFaces(imageData, size, uvCoords, uvFaces, uvImgCoords,
+      srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask,
+      uvDepths, expectedWindingSign);
+
+    // Apply UV mask
+    const uvMask = this._buildUVMask(size, uvCoords, uvFaces);
+    this._applyUVMask(imageData, size, uvMask);
+
+    // Build per-pixel confidence from face visibility
+    // For each UV pixel, find which face it belongs to and use that face's N·V
+    const confidence = new Float32Array(size * size);
+    const nFaces = uvFaces.length / 3;
+
+    // Rasterize face visibility into UV pixel confidence
+    for (let f = 0; f < nFaces; f++) {
+      const vis = faceVisibility[f];
+      if (vis <= 0) continue;
+
+      const ui0 = uvFaces[f * 3], ui1 = uvFaces[f * 3 + 1], ui2 = uvFaces[f * 3 + 2];
+      const ux0 = uvCoords[ui0 * 2] * size, uy0 = uvCoords[ui0 * 2 + 1] * size;
+      const ux1 = uvCoords[ui1 * 2] * size, uy1 = uvCoords[ui1 * 2 + 1] * size;
+      const ux2 = uvCoords[ui2 * 2] * size, uy2 = uvCoords[ui2 * 2 + 1] * size;
+
+      const minX = Math.max(0, Math.floor(Math.min(ux0, ux1, ux2)));
+      const maxX = Math.min(size - 1, Math.ceil(Math.max(ux0, ux1, ux2)));
+      const minY = Math.max(0, Math.floor(Math.min(uy0, uy1, uy2)));
+      const maxY = Math.min(size - 1, Math.ceil(Math.max(uy0, uy1, uy2)));
+
+      const area = (ux1 - ux0) * (uy2 - uy0) - (ux2 - ux0) * (uy1 - uy0);
+      if (Math.abs(area) < 0.01) continue;
+      const invArea = 1.0 / area;
+
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const w0 = ((ux1 - x) * (uy2 - y) - (ux2 - x) * (uy1 - y)) * invArea;
+          const w1 = ((ux2 - x) * (uy0 - y) - (ux0 - x) * (uy2 - y)) * invArea;
+          const w2 = 1.0 - w0 - w1;
+          if (w0 < -0.01 || w1 < -0.01 || w2 < -0.01) continue;
+
+          const idx = y * size + x;
+          // Only set confidence where we have actual pixel data
+          if (imageData.data[idx * 4 + 3] > 0) {
+            confidence[idx] = Math.max(confidence[idx], vis);
+          }
+        }
+      }
+    }
+
+    // Count mapped pixels
+    let mappedPixels = 0;
+    for (let i = 0; i < size * size; i++) {
+      if (imageData.data[i * 4 + 3] > 0) mappedPixels++;
+    }
+
+    return {
+      imageData,
+      confidence,
+      faceVisibility,
+      projectedCoords,
+      mappedPixels,
+      debugData: {
+        srcCanvas, srcW, srcH, img,
+        ctrlU, ctrlV, ctrlIX, ctrlIY, N: ctrlU.length,
+        landmarks, mpIndices, mapping
+      }
+    };
+  }
+
+  /**
+   * Color harmonization: match side views' mean brightness/color to front view
+   * in their overlapping regions. This compensates for different lighting
+   * conditions between photos.
+   */
+  _harmonizeMultiViewColors(outImageData, viewProjections, size) {
+    if (viewProjections.length < 2) return;
+
+    const frontProj = viewProjections[0];
+    const N = size * size;
+
+    for (let v = 1; v < viewProjections.length; v++) {
+      const sideProj = viewProjections[v];
+      const fd = frontProj.imageData.data;
+      const sd = sideProj.imageData.data;
+
+      // Find overlapping pixels (both views have data)
+      let fR = 0, fG = 0, fB = 0, sR = 0, sG = 0, sB = 0, count = 0;
+      for (let i = 0; i < N; i++) {
+        if (fd[i * 4 + 3] > 0 && sd[i * 4 + 3] > 0) {
+          fR += fd[i * 4]; fG += fd[i * 4 + 1]; fB += fd[i * 4 + 2];
+          sR += sd[i * 4]; sG += sd[i * 4 + 1]; sB += sd[i * 4 + 2];
+          count++;
+        }
+      }
+
+      if (count < 100) {
+        console.log(`PhotoUploader MULTI: ${sideProj.label} — insufficient overlap (${count}px), skipping harmonization`);
+        continue;
+      }
+
+      // Compute brightness ratios in overlap
+      const ratioR = (fR / count) / Math.max(1, sR / count);
+      const ratioG = (fG / count) / Math.max(1, sG / count);
+      const ratioB = (fB / count) / Math.max(1, sB / count);
+
+      // Clamp to prevent extreme corrections (max 40% shift)
+      const clamp = (v) => Math.max(0.6, Math.min(1.4, v));
+      const cR = clamp(ratioR), cG = clamp(ratioG), cB = clamp(ratioB);
+
+      console.log(`PhotoUploader MULTI: ${sideProj.label} harmonization: R=${cR.toFixed(3)}, G=${cG.toFixed(3)}, B=${cB.toFixed(3)} (${count} overlap pixels)`);
+
+      // Apply correction to the accumulated output, weighted by how much
+      // this side view contributed. We correct pixels where side view was
+      // the dominant contributor (front confidence < side confidence).
+      const od = outImageData.data;
+      const fc = frontProj.confidence;
+      const sc = sideProj.confidence;
+
+      for (let i = 0; i < N; i++) {
+        // Only correct pixels where side view contributed more than front
+        if (sc[i] <= 0 || fc[i] >= sc[i]) continue;
+        if (od[i * 4 + 3] === 0) continue;
+
+        // Blend strength: proportional to how dominant side view is
+        const totalW = fc[i] + sc[i];
+        const sideWeight = totalW > 0 ? sc[i] / totalW : 0;
+        const corrStr = sideWeight; // 0 = front dominant, 1 = side dominant
+
+        const idx = i * 4;
+        od[idx]     = Math.max(0, Math.min(255, Math.round(od[idx] * (1 + corrStr * (cR - 1)))));
+        od[idx + 1] = Math.max(0, Math.min(255, Math.round(od[idx + 1] * (1 + corrStr * (cG - 1)))));
+        od[idx + 2] = Math.max(0, Math.min(255, Math.round(od[idx + 2] * (1 + corrStr * (cB - 1)))));
+      }
+    }
   }
 
   // -----------------------------------------------------------------------
