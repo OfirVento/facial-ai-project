@@ -248,28 +248,29 @@ export class FaceRenderer {
     const hasHDRI = this.scene && this.scene.environment;
 
     if (hasHDRI) {
-      // Phase 2: HDRI provides the primary illumination.
-      // Keep directional lights very low — just subtle fill cues.
+      // Phase 2: Photo already contains baked lighting.
+      // With reduced envMapIntensity (0.3), direct lights provide subtle 3D cues.
+      // Total light energy kept low to preserve photo's original brightness.
       if (this.lights.key) {
-        this.lights.key.intensity = 0.3;
+        this.lights.key.intensity = 0.15;          // very subtle directional cue
         this.lights.key.color.set(0xffffff);
         this.lights.key.castShadow = false;
       }
       if (this.lights.fill) {
-        this.lights.fill.intensity = 0.15;
+        this.lights.fill.intensity = 0.1;
         this.lights.fill.color.set(0xffffff);
       }
       if (this.lights.rim) {
-        this.lights.rim.intensity = 0.1;
+        this.lights.rim.intensity = 0.05;
       }
       if (this.lights.ambient) {
-        this.lights.ambient.intensity = 0.2;       // low — HDRI ambient handles this
+        this.lights.ambient.intensity = 0.15;      // minimal — env + photo handle this
         this.lights.ambient.color.set(0xffffff);
       }
       if (this.lights.rectArea) {
-        this.lights.rectArea.intensity = 0.1;
+        this.lights.rectArea.intensity = 0.05;
       }
-      console.log('FaceRenderer: Photo lighting (HDRI-assisted)');
+      console.log('FaceRenderer: Photo lighting (HDRI-assisted, reduced)');
     } else {
       // Fallback: no HDRI — use nearly flat lighting (Phase 10 legacy)
       if (this.lights.key) {
@@ -383,20 +384,23 @@ export class FaceRenderer {
     mat.map = texture;
     mat.color.set(0xffffff);      // don't tint the texture
 
-    // Moderate PBR for realistic skin appearance
-    mat.roughness = 0.6;          // slightly rough skin
+    // Conservative PBR for photo-textured face:
+    // The photo already contains most visual detail — PBR adds subtle 3D cues only
+    mat.roughness = 0.75;         // fairly rough → minimizes specular washing out the photo
     mat.metalness = 0.0;
-    mat.sheen = 0.15;             // subtle skin micro-fiber look
-    mat.sheenRoughness = 0.5;
+    mat.sheen = 0.08;             // very subtle skin micro-fiber look
+    mat.sheenRoughness = 0.6;
     mat.sheenColor.set(0xffddcc);
-    mat.clearcoat = 0.03;         // minimal oily highlights
-    mat.clearcoatRoughness = 0.4;
+    mat.clearcoat = 0.02;         // barely visible oily highlights
+    mat.clearcoatRoughness = 0.5;
     mat.transmission = 0;         // no SSS on photo-textured mesh
     mat.thickness = 0;
 
     // Tone mapping ON — proper ACES color management
     mat.toneMapped = true;
-    mat.envMapIntensity = 1.0;    // full HDRI contribution
+    // Reduced HDRI contribution — photo already has baked lighting,
+    // we only want subtle environment fill, not full IBL
+    mat.envMapIntensity = 0.3;
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
@@ -404,12 +408,12 @@ export class FaceRenderer {
     // Adjust lighting for HDRI photo mode
     this._setPhotoLighting();
 
-    // Bump exposure slightly to compensate for ACES midtone compression
+    // Keep exposure at 1.0 — ACES handles it fine with reduced env intensity
     if (this.renderer) {
-      this.renderer.toneMappingExposure = 1.2;
+      this.renderer.toneMappingExposure = 1.0;
     }
 
-    console.log('FaceRenderer: PBR photo mode (HDRI + tone mapping enabled)');
+    console.log('FaceRenderer: PBR photo mode (HDRI=0.3, roughness=0.75)');
   }
 
   /**
