@@ -481,7 +481,8 @@ export class FaceRenderer {
     // Tone mapping ON — ACES is gentle on emissive values in 0-1 range
     mat.toneMapped = true;
     // Subtle HDRI specular: with color=black, only specular lobe responds
-    mat.envMapIntensity = 0.08;
+    // Reduced from 0.08 → 0.04 to minimize visible shiny patches on forehead/nose
+    mat.envMapIntensity = 0.04;
     mat.side = THREE.FrontSide;
 
     mat.needsUpdate = true;
@@ -494,7 +495,7 @@ export class FaceRenderer {
       this.renderer.toneMappingExposure = 1.0;
     }
 
-    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.08, roughness=0.7)');
+    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.04, roughness=0.7)');
   }
 
   /**

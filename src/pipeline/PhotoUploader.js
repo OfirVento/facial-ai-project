@@ -703,8 +703,13 @@ export class PhotoUploader {
     // --- 5c. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    // Phase 10b: wider radius (size/32 vs size/64) for smoother photo→albedo transition
-    this._softenAlphaBoundary(outImageData, size, Math.max(16, Math.round(size / 32)));
+    // Hybrid mode: wider radius (~85px at 2048) for smoother forehead/scalp transition
+    // PBR mode: narrower (~64px) since delighting flattens brightness differences
+    const renderMode = this._renderModeHint || 'hybrid';
+    const softenRadius = renderMode === 'hybrid'
+      ? Math.max(24, Math.round(size / 24))    // ~85px at 2048
+      : Math.max(16, Math.round(size / 32));    // ~64px at 2048
+    this._softenAlphaBoundary(outImageData, size, softenRadius);
 
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
