@@ -462,6 +462,14 @@ export class FaceRenderer {
     // Clear any existing diffuse map
     if (mat.map) { mat.map = null; }
 
+    // Expert round 3: disable normal map in hybrid mode.
+    // Current normalMap is from raw image-space photo (doesn't match UV texture).
+    // Will reintroduce once computed from UV-space texture + masked to photo regions.
+    if (mat.normalMap) {
+      mat.normalMap.dispose();
+      mat.normalMap = null;
+    }
+
     // Photo → emissive: bypasses BRDF 1/π, shown at full brightness
     mat.emissiveMap = texture;
     mat.emissive.set(0xffffff);
@@ -718,6 +726,52 @@ export class FaceRenderer {
 
     this.faceMaterial.needsUpdate = true;
     return texture;
+  }
+
+  /**
+   * Apply a diagnostic overlay texture onto the 3D head (replaces emissive/albedo temporarily).
+   * Call restoreDiagOverlay() to switch back to the real photo texture.
+   * @param {string} dataUrl - PNG data URL of the diagnostic overlay
+   */
+  async applyDiagOverlay(dataUrl) {
+    if (!this._diagBackup && this._photoTexture) {
+      this._diagBackup = {
+        emissiveMap: this.faceMaterial.emissiveMap,
+        emissive: this.faceMaterial.emissive.clone(),
+        emissiveIntensity: this.faceMaterial.emissiveIntensity,
+        color: this.faceMaterial.color.clone(),
+        envMapIntensity: this.faceMaterial.envMapIntensity,
+      };
+    }
+    const loader = new THREE.TextureLoader();
+    const tex = await loader.loadAsync(dataUrl);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.flipY = false;
+    tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+
+    this.faceMaterial.emissiveMap = tex;
+    this.faceMaterial.emissive.set(0xffffff);
+    this.faceMaterial.emissiveIntensity = 1.0;
+    this.faceMaterial.color.set(0x000000);
+    this.faceMaterial.envMapIntensity = 0;
+    this.faceMaterial.needsUpdate = true;
+    console.log('FaceRenderer: Diagnostic overlay applied');
+  }
+
+  /**
+   * Restore the original photo texture after a diagnostic overlay was shown.
+   */
+  restoreDiagOverlay() {
+    if (!this._diagBackup) return;
+    const mat = this.faceMaterial;
+    mat.emissiveMap = this._diagBackup.emissiveMap;
+    mat.emissive.copy(this._diagBackup.emissive);
+    mat.emissiveIntensity = this._diagBackup.emissiveIntensity;
+    mat.color.copy(this._diagBackup.color);
+    mat.envMapIntensity = this._diagBackup.envMapIntensity;
+    mat.needsUpdate = true;
+    this._diagBackup = null;
+    console.log('FaceRenderer: Restored photo texture from diagnostic overlay');
   }
 
   /**

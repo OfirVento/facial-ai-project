@@ -464,7 +464,13 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         console.log('App: Texture generated, applying...');
 
         btn.textContent = 'Applying texture...';
-        const normalMap = await this.photoUploader.generateNormalMapFromPhoto();
+
+        // Expert round 3: normal map is computed from raw image-space photo (wrong!).
+        // It doesn't align with the UV-projected texture → waxy look + pseudo artifacts.
+        // Disable in hybrid mode. Only re-enable once computed from UV-space texture.
+        const normalMap = renderMode !== 'hybrid'
+          ? await this.photoUploader.generateNormalMapFromPhoto()
+          : null;
 
         // Apply photo texture to existing mesh
         // flipY=false because the rasterizer writes UV V directly to canvas Y
@@ -929,6 +935,35 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     panel.appendChild(makeBtn('⚪ Toggle Gray Sphere', () => {
       if (this.renderer?._graySphere) this.renderer.hideGraySphere();
       else this.renderer?.showGraySphere();
+    }));
+
+    // Separator: P1 Diagnostic Overlays
+    const sep3 = document.createElement('div');
+    sep3.style.cssText = 'height:1px;background:#444;margin:4px 0';
+    panel.appendChild(sep3);
+
+    const diagLabel = document.createElement('div');
+    diagLabel.style.cssText = 'color:#888;font-size:10px;margin-bottom:2px';
+    diagLabel.textContent = 'Diagnostic Overlays:';
+    panel.appendChild(diagLabel);
+
+    panel.appendChild(makeBtn('🟢 Coverage Heatmap', () => {
+      const url = uploader.generateCoverageHeatmap();
+      if (url) this.renderer?.applyDiagOverlay(url);
+      else alert('No coverage data — generate texture first');
+    }));
+    panel.appendChild(makeBtn('🔴 N·V Visibility', () => {
+      const url = uploader.generateNVHeatmap();
+      if (url) this.renderer?.applyDiagOverlay(url);
+      else alert('No visibility data — generate texture first');
+    }));
+    panel.appendChild(makeBtn('🔵 UV Landmarks', () => {
+      const url = uploader.generateLandmarkOverlay();
+      if (url) this.renderer?.applyDiagOverlay(url);
+      else alert('No landmark data — generate texture first');
+    }));
+    panel.appendChild(makeBtn('🔄 Restore Photo', () => {
+      this.renderer?.restoreDiagOverlay();
     }));
 
     // Separator

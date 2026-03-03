@@ -588,6 +588,12 @@ export class PhotoUploader {
     // --- 3. Compute per-face visibility (backface culling) ---
     const faceVisibility = this._computeFaceVisibility(meshGen, cameraParams);
 
+    // Store diagnostic data for overlay rendering (P1 expert requirement)
+    this._diagCameraParams = cameraParams;
+    this._diagFaceVisibility = faceVisibility;
+    this._diagProjectedCoords = projectedCoords;
+    this._diagMeshGen = meshGen;
+
     // --- 3b. Build debug overlay: MediaPipe landmarks + projected FLAME outline ---
     this._buildDebugOverlay(img, landmarks, projectedCoords, meshGen, srcW, srcH);
 
@@ -703,17 +709,34 @@ export class PhotoUploader {
     // --- 5c-i. Expert: erode alpha inward before softening ---
     // Forces the blend band to live entirely in "safe skin pixels" and avoids
     // pulling in boundary contamination (hair, background, ear edge).
+
+    // P1 diagnostic: snapshot coverage alpha BEFORE erosion for overlay comparison
+    const preErosionAlpha = new Uint8Array(size * size);
+    for (let i = 0; i < size * size; i++) preErosionAlpha[i] = outImageData.data[i * 4 + 3];
+    this._diagPreErosionAlpha = preErosionAlpha;
+    this._diagTextureSize = size;
+
     const ERODE_PX = Math.max(8, Math.round(size / 160));  // ~12px at 2048
     this._erodeAlpha(outImageData, size, ERODE_PX);
+
+    // P2 Expert: extra erosion in forehead/scalp region where photo-to-bald-head
+    // transition is most visible. FLAME UV: V≈0.65+ is forehead/scalp zone.
+    // Move the blend boundary further inward into safe skin pixels.
+    const FOREHEAD_EXTRA_ERODE = Math.max(8, Math.round(size / 160));  // ~12px extra
+    this._erodeAlphaRegion(outImageData, size, FOREHEAD_EXTRA_ERODE, 0.60, 1.0);
 
     // --- 5c-ii. Soften alpha boundaries for smooth blending transitions ---
     // The alpha channel is the blend mask for Laplacian blending.
     // Blurring it creates gradual photo-to-albedo transitions at all edges.
+    // P2 Expert: region-specific feather — wider in forehead, standard elsewhere
     const renderMode = this._renderModeHint || 'hybrid';
     const softenRadius = renderMode === 'hybrid'
       ? Math.max(24, Math.round(size / 24))    // ~85px at 2048
       : Math.max(16, Math.round(size / 32));    // ~64px at 2048
-    this._softenAlphaBoundary(outImageData, size, softenRadius);
+    const foreheadSoftenRadius = renderMode === 'hybrid'
+      ? Math.max(40, Math.round(size / 16))    // ~128px at 2048 for forehead
+      : softenRadius;
+    this._softenAlphaBoundaryRegional(outImageData, size, softenRadius, foreheadSoftenRadius, 0.60);
 
     // --- Save pre-fill texture for debug ---
     const preFillCanvas = document.createElement('canvas');
@@ -752,6 +775,19 @@ export class PhotoUploader {
     }
 
     const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
+
+    // --- P3 Expert: boundary-ring color matching ---
+    // Corrects ear/temple color mismatch at the photo-to-albedo seam.
+    // Samples a narrow band on each side of the boundary and applies a
+    // local correction with radial falloff.
+    this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
+
+    // --- P4 Expert: bake subtle AO into texture for depth cues ---
+    // Emissive mode is angle-invariant → face feels flat. Instead of adding
+    // more specular (= plastic wrap), bake ambient occlusion from mesh geometry.
+    // Only affects albedo-dominant regions (photo regions have natural shadows).
+    this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
+
     ctx.putImageData(blendedData, 0, 0);
 
     console.log('PhotoUploader: Dense projection texture complete');
@@ -1811,6 +1847,134 @@ export class PhotoUploader {
     }
   }
 
+  // -----------------------------------------------------------------------
+  // P1 Diagnostic Overlay Generators (Expert Round 3)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Generate a UV-space coverage heatmap texture (data URL).
+   * Green = full photo coverage, Yellow = partial (blend zone), Red = no coverage.
+   * Uses pre-erosion alpha to show the raw projection footprint.
+   */
+  generateCoverageHeatmap() {
+    const alpha = this._diagPreErosionAlpha;
+    const size = this._diagTextureSize;
+    if (!alpha || !size) return null;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+
+    for (let i = 0; i < size * size; i++) {
+      const a = alpha[i];
+      const idx = i * 4;
+      if (a > 200) {
+        // Full coverage: green
+        d[idx] = 0; d[idx + 1] = 200; d[idx + 2] = 0; d[idx + 3] = 180;
+      } else if (a > 0) {
+        // Partial coverage: yellow, opacity proportional
+        d[idx] = 255; d[idx + 1] = 200; d[idx + 2] = 0; d[idx + 3] = 150;
+      } else {
+        // No coverage: red
+        d[idx] = 200; d[idx + 1] = 0; d[idx + 2] = 0; d[idx + 3] = 120;
+      }
+    }
+
+    ctx.putImageData(img, 0, 0);
+    return canvas.toDataURL('image/png');
+  }
+
+  /**
+   * Generate a UV-space N·V (face visibility) heatmap texture.
+   * Green = fully visible (N·V > 0.45), Yellow = fade zone, Red = rejected.
+   * Rasterizes per-face visibility values into UV space.
+   */
+  generateNVHeatmap() {
+    const visibility = this._diagFaceVisibility;
+    const meshGen = this._diagMeshGen;
+    const size = this._diagTextureSize;
+    if (!visibility || !meshGen || !size) return null;
+
+    const uvCoords = meshGen.flameUVCoords;
+    const uvFaces = meshGen.flameUVFaces;
+    const nFaces = uvFaces.length / 3;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+
+    // Rasterize each face with its visibility color
+    for (let f = 0; f < nFaces; f++) {
+      const vis = visibility[f];
+      const ui0 = uvFaces[f * 3], ui1 = uvFaces[f * 3 + 1], ui2 = uvFaces[f * 3 + 2];
+      const x0 = uvCoords[ui0 * 2] * size, y0 = uvCoords[ui0 * 2 + 1] * size;
+      const x1 = uvCoords[ui1 * 2] * size, y1 = uvCoords[ui1 * 2 + 1] * size;
+      const x2 = uvCoords[ui2 * 2] * size, y2 = uvCoords[ui2 * 2 + 1] * size;
+
+      // Color by visibility
+      let r, g, b;
+      if (vis >= 1.0) {
+        r = 0; g = 200; b = 0;   // full visible: green
+      } else if (vis > 0) {
+        r = 255; g = 200; b = 0;  // fade zone: yellow
+      } else {
+        r = 200; g = 0; b = 0;    // rejected: red
+      }
+
+      ctx.fillStyle = `rgba(${r},${g},${b},0.7)`;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    return canvas.toDataURL('image/png');
+  }
+
+  /**
+   * Generate a UV-space landmark overlay texture.
+   * Shows projected 3D landmark positions as colored dots in UV space.
+   * Green = low reprojection error, Red = high error.
+   */
+  generateLandmarkOverlay() {
+    const debug = this._lastDebugData;
+    const size = this._diagTextureSize;
+    if (!debug || !size) return null;
+
+    const { ctrlU, ctrlV, N } = debug;
+    if (!ctrlU || N < 1) return null;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+
+    // Draw landmark positions as dots in UV space
+    for (let i = 0; i < N; i++) {
+      const x = ctrlU[i] * size;
+      const y = ctrlV[i] * size;
+
+      // All landmarks in cyan for now; could color by reprojection error
+      ctx.fillStyle = '#00ffff';
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Add a white border for visibility
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    return canvas.toDataURL('image/png');
+  }
+
   /**
    * Build a binary mask on the source photo that marks pixels inside the face boundary.
    * Uses MediaPipe's face oval landmarks to create a polygon, then rasterises it.
@@ -2382,6 +2546,137 @@ export class PhotoUploader {
     }
 
     console.log(`PhotoUploader DENSE: Alpha erosion: ${erodedCount} pixels eroded (radius=${radius})`);
+  }
+
+  /**
+   * Region-specific alpha erosion: erode only pixels within a UV V range.
+   * Used to push the forehead/scalp boundary inward where the photo-to-bald
+   * transition is most visible.
+   * @param {ImageData} imageData
+   * @param {number} size
+   * @param {number} radius - erosion radius in pixels
+   * @param {number} vMin - minimum V coordinate (0-1) for the region
+   * @param {number} vMax - maximum V coordinate (0-1) for the region
+   */
+  _erodeAlphaRegion(imageData, size, radius, vMin, vMax) {
+    const data = imageData.data;
+    const N = size * size;
+    const yMin = Math.floor(vMin * size);
+    const yMax = Math.ceil(vMax * size);
+
+    // Extract binary mask for full image (needed for distance computation)
+    const mask = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      mask[i] = data[i * 4 + 3] > 0 ? 1 : 0;
+    }
+
+    // Horizontal distance pass (full image, needed for correctness at boundaries)
+    const hDist = new Int16Array(N);
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      let dist = radius + 1;
+      for (let x = 0; x < size; x++) {
+        dist = mask[row + x] === 0 ? 0 : dist + 1;
+        hDist[row + x] = dist;
+      }
+      dist = radius + 1;
+      for (let x = size - 1; x >= 0; x--) {
+        dist = mask[row + x] === 0 ? 0 : dist + 1;
+        hDist[row + x] = Math.min(hDist[row + x], dist);
+      }
+    }
+
+    // Vertical pass + erosion — only apply in the V region
+    let erodedCount = 0;
+    const vTemp = new Int16Array(size);
+    for (let x = 0; x < size; x++) {
+      for (let y = 0; y < size; y++) vTemp[y] = hDist[y * size + x];
+      for (let y = yMin; y < yMax && y < size; y++) {
+        if (mask[y * size + x] === 0) continue;
+        let minH = vTemp[y];
+        const ys = Math.max(0, y - radius);
+        const ye = Math.min(size - 1, y + radius);
+        for (let yy = ys; yy <= ye; yy++) {
+          if (vTemp[yy] < minH) minH = vTemp[yy];
+          if (minH === 0) break;
+        }
+        if (minH <= radius) {
+          data[(y * size + x) * 4 + 3] = 0;
+          erodedCount++;
+        }
+      }
+    }
+    console.log(`PhotoUploader DENSE: Region erosion (V=${vMin}-${vMax}): ${erodedCount} pixels eroded (radius=${radius})`);
+  }
+
+  /**
+   * Region-aware alpha softening: applies wider blur in forehead/scalp zone.
+   * Uses two passes — standard radius for most of the face, wider radius
+   * for the forehead region — then blends the results by V coordinate.
+   */
+  _softenAlphaBoundaryRegional(imageData, size, baseRadius, foreheadRadius, foreheadVThreshold) {
+    const data = imageData.data;
+    const N = size * size;
+
+    // Extract alpha
+    const alpha = new Float32Array(N);
+    for (let i = 0; i < N; i++) alpha[i] = data[i * 4 + 3];
+
+    // Blur with base radius
+    const blurredBase = this._boxBlurAlpha(alpha, size, baseRadius);
+    // Blur with forehead radius (wider)
+    const blurredWide = this._boxBlurAlpha(alpha, size, foreheadRadius);
+
+    // Blend: use wider blur in forehead region, base elsewhere, with smooth transition
+    const transitionBand = 0.05; // 5% of UV space for smooth transition
+    let softened = 0;
+    for (let i = 0; i < N; i++) {
+      const v = Math.floor(i / size) / size;
+      // Smooth blend factor: 0 in face region, 1 in forehead region
+      let foreheadBlend = 0;
+      if (v > foreheadVThreshold + transitionBand) {
+        foreheadBlend = 1.0;
+      } else if (v > foreheadVThreshold - transitionBand) {
+        foreheadBlend = (v - foreheadVThreshold + transitionBand) / (2 * transitionBand);
+      }
+
+      const blurred = blurredBase[i] * (1 - foreheadBlend) + blurredWide[i] * foreheadBlend;
+      const newAlpha = Math.min(alpha[i], blurred);
+      if (newAlpha < alpha[i]) softened++;
+      data[i * 4 + 3] = Math.round(newAlpha);
+    }
+    console.log(`PhotoUploader DENSE: Regional alpha softening: ${softened} pixels softened (base=${baseRadius}, forehead=${foreheadRadius})`);
+  }
+
+  /**
+   * Two-pass box blur on a single-channel Float32Array.
+   * @returns {Float32Array} blurred result
+   */
+  _boxBlurAlpha(alpha, size, radius) {
+    const N = size * size;
+    const tmp = new Float32Array(N);
+    // Horizontal pass
+    for (let y = 0; y < size; y++) {
+      let sum = 0, count = 0;
+      for (let x = 0; x < Math.min(radius, size); x++) { sum += alpha[y * size + x]; count++; }
+      for (let x = 0; x < size; x++) {
+        if (x + radius < size) { sum += alpha[y * size + x + radius]; count++; }
+        if (x - radius - 1 >= 0) { sum -= alpha[y * size + x - radius - 1]; count--; }
+        tmp[y * size + x] = sum / count;
+      }
+    }
+    // Vertical pass
+    const blurred = new Float32Array(N);
+    for (let x = 0; x < size; x++) {
+      let sum = 0, count = 0;
+      for (let y = 0; y < Math.min(radius, size); y++) { sum += tmp[y * size + x]; count++; }
+      for (let y = 0; y < size; y++) {
+        if (y + radius < size) { sum += tmp[(y + radius) * size + x]; count++; }
+        if (y - radius - 1 >= 0) { sum -= tmp[(y - radius - 1) * size + x]; count--; }
+        blurred[y * size + x] = sum / count;
+      }
+    }
+    return blurred;
   }
 
   /**
@@ -3193,6 +3488,273 @@ export class PhotoUploader {
 
     console.log(`Laplacian blend: ${levels} levels, mask-normalized, ${size}x${size}`);
     return outData;
+  }
+
+  /**
+   * P3 Expert: boundary-ring color matching.
+   * Finds the photo-to-albedo boundary in the blended result, samples a narrow
+   * band on each side, computes a local correction ratio, and applies it to
+   * albedo-dominant pixels near the boundary with radial falloff.
+   * This reduces the visible color seam at ears/temples without full spatial tinting.
+   *
+   * @param {ImageData} blendedData - the Laplacian-blended result (modified in place)
+   * @param {ImageData} photoData - original photo UV texture (with alpha = coverage)
+   * @param {ImageData} albedoData - color-corrected albedo layer
+   * @param {number} size - texture size
+   */
+  _boundaryRingMatch(blendedData, photoData, albedoData, size) {
+    const bd = blendedData.data;
+    const pd = photoData.data;
+    const N = size * size;
+
+    // Step 1: Find boundary pixels — where photo alpha transitions from high to low.
+    // Use the photo's alpha to identify the blend boundary.
+    const alpha = new Float32Array(N);
+    for (let i = 0; i < N; i++) alpha[i] = pd[i * 4 + 3] / 255;
+
+    // Compute distance to boundary (approximate): distance to nearest alpha transition
+    // Boundary is where alpha is in the 0.2-0.8 range (the blend zone)
+    const INNER_BAND = 20;  // pixels inward from boundary (photo-dominant side)
+    const OUTER_BAND = 40;  // pixels outward from boundary (albedo-dominant side)
+    const FALLOFF_DIST = 80; // how far the correction fades out
+
+    // Identify boundary pixels (where alpha is mid-range after softening)
+    // For the blended result, we detect boundary differently:
+    // compare blended color to photo color — large difference = boundary/albedo zone
+    // Simpler: use the photo alpha mask to identify inner vs outer ring.
+
+    // Find pixels near the boundary using alpha gradient
+    // Inner ring: alpha 0.6-0.95 (photo-dominant near boundary)
+    // Outer ring: alpha 0.05-0.4 (albedo-dominant near boundary)
+    let innerR = 0, innerG = 0, innerB = 0, innerCount = 0;
+    let outerR = 0, outerG = 0, outerB = 0, outerCount = 0;
+
+    for (let i = 0; i < N; i++) {
+      const a = alpha[i];
+      const r = bd[i * 4], g = bd[i * 4 + 1], b = bd[i * 4 + 2];
+      // Skip very dark or very bright pixels (unreliable)
+      const lum = r * 0.2126 + g * 0.7152 + b * 0.0722;
+      if (lum < 40 || lum > 240) continue;
+
+      if (a >= 0.6 && a <= 0.95) {
+        // Inner band: photo-dominant side of boundary
+        innerR += r; innerG += g; innerB += b;
+        innerCount++;
+      } else if (a >= 0.05 && a <= 0.4) {
+        // Outer band: albedo-dominant side of boundary
+        outerR += r; outerG += g; outerB += b;
+        outerCount++;
+      }
+    }
+
+    if (innerCount < 50 || outerCount < 50) {
+      console.log(`Boundary ring match: insufficient samples (inner=${innerCount}, outer=${outerCount}), skipping`);
+      return;
+    }
+
+    // Compute mean colors for each ring
+    innerR /= innerCount; innerG /= innerCount; innerB /= innerCount;
+    outerR /= outerCount; outerG /= outerCount; outerB /= outerCount;
+
+    // Correction ratios: what multiplier would make outer ring match inner ring?
+    const corrR = innerR > 5 ? (innerR / Math.max(5, outerR)) : 1;
+    const corrG = innerG > 5 ? (innerG / Math.max(5, outerG)) : 1;
+    const corrB = innerB > 5 ? (innerB / Math.max(5, outerB)) : 1;
+
+    // Clamp to prevent wild corrections (max 30% shift)
+    const clamp = (v) => Math.max(0.7, Math.min(1.3, v));
+    const cR = clamp(corrR), cG = clamp(corrG), cB = clamp(corrB);
+
+    console.log(`Boundary ring match: inner RGB=(${innerR.toFixed(0)},${innerG.toFixed(0)},${innerB.toFixed(0)}), outer RGB=(${outerR.toFixed(0)},${outerG.toFixed(0)},${outerB.toFixed(0)})`);
+    console.log(`Boundary ring match: correction R=${cR.toFixed(3)}, G=${cG.toFixed(3)}, B=${cB.toFixed(3)}`);
+
+    // Apply correction with falloff based on alpha (how "albedo-dominant" each pixel is)
+    // Pixels with alpha=0 get full correction, alpha=1 get no correction.
+    // The falloff is: strength = (1 - alpha) * correctionStrength
+    let correctedCount = 0;
+    for (let i = 0; i < N; i++) {
+      const a = alpha[i];
+      if (a >= 0.95) continue; // Fully photo-mapped, no correction needed
+      if (a <= 0) continue;    // Fully outside, apply full correction
+
+      // Smooth falloff: full correction at a=0, zero at a=0.8
+      const strength = Math.max(0, Math.min(1, (0.8 - a) / 0.8));
+      if (strength < 0.01) continue;
+
+      const idx = i * 4;
+      const r = bd[idx], g = bd[idx + 1], b = bd[idx + 2];
+
+      // Blend toward corrected color
+      bd[idx]     = Math.max(0, Math.min(255, Math.round(r * (1 + strength * (cR - 1)))));
+      bd[idx + 1] = Math.max(0, Math.min(255, Math.round(g * (1 + strength * (cG - 1)))));
+      bd[idx + 2] = Math.max(0, Math.min(255, Math.round(b * (1 + strength * (cB - 1)))));
+      correctedCount++;
+    }
+
+    console.log(`Boundary ring match: ${correctedCount} pixels color-corrected`);
+  }
+
+  /**
+   * P4 Expert: bake subtle ambient occlusion into the texture.
+   * Computes per-vertex AO from mesh concavity (vertex normal vs. average
+   * neighbor normal divergence) and rasterizes it into UV space.
+   * Applied strongest in albedo-dominant regions, subtle in photo regions.
+   *
+   * This adds depth cues (darker eye sockets, nostrils, under-chin) without
+   * requiring custom shaders or increasing specular (which causes plastic wrap).
+   */
+  _bakeSubtleAO(blendedData, photoData, meshGen, size) {
+    const posFaces = meshGen.flameFaces;
+    const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
+    const uvCoords = meshGen.flameUVCoords;
+    const uvFaces = meshGen.flameUVFaces;
+    if (!posFaces || !verts || !uvCoords || !uvFaces) return;
+
+    const nVerts = verts.length / 3;
+    const nFaces = posFaces.length / 3;
+
+    // Step 1: Compute per-vertex normals (area-weighted)
+    const normals = new Float32Array(nVerts * 3);
+    for (let f = 0; f < nFaces; f++) {
+      const i0 = posFaces[f * 3], i1 = posFaces[f * 3 + 1], i2 = posFaces[f * 3 + 2];
+      const x0 = verts[i0 * 3], y0 = verts[i0 * 3 + 1], z0 = verts[i0 * 3 + 2];
+      const x1 = verts[i1 * 3], y1 = verts[i1 * 3 + 1], z1 = verts[i1 * 3 + 2];
+      const x2 = verts[i2 * 3], y2 = verts[i2 * 3 + 1], z2 = verts[i2 * 3 + 2];
+      const ex1 = x1 - x0, ey1 = y1 - y0, ez1 = z1 - z0;
+      const ex2 = x2 - x0, ey2 = y2 - y0, ez2 = z2 - z0;
+      const nx = ey1 * ez2 - ez1 * ey2;
+      const ny = ez1 * ex2 - ex1 * ez2;
+      const nz = ex1 * ey2 - ey1 * ex2;
+      for (const vi of [i0, i1, i2]) {
+        normals[vi * 3] += nx;
+        normals[vi * 3 + 1] += ny;
+        normals[vi * 3 + 2] += nz;
+      }
+    }
+    // Normalize
+    for (let i = 0; i < nVerts; i++) {
+      const x = normals[i * 3], y = normals[i * 3 + 1], z = normals[i * 3 + 2];
+      const len = Math.sqrt(x * x + y * y + z * z);
+      if (len > 1e-10) {
+        normals[i * 3] /= len; normals[i * 3 + 1] /= len; normals[i * 3 + 2] /= len;
+      }
+    }
+
+    // Step 2: Compute per-vertex AO from concavity
+    // Build adjacency: for each vertex, collect neighbor vertex indices
+    const neighbors = new Array(nVerts);
+    for (let i = 0; i < nVerts; i++) neighbors[i] = new Set();
+    for (let f = 0; f < nFaces; f++) {
+      const i0 = posFaces[f * 3], i1 = posFaces[f * 3 + 1], i2 = posFaces[f * 3 + 2];
+      neighbors[i0].add(i1); neighbors[i0].add(i2);
+      neighbors[i1].add(i0); neighbors[i1].add(i2);
+      neighbors[i2].add(i0); neighbors[i2].add(i1);
+    }
+
+    // AO = how much the vertex is "enclosed" by neighbors
+    // Measure: average dot(normal, direction to neighbor)
+    // Negative average = convex (exposed), positive average = concave (occluded)
+    const vertexAO = new Float32Array(nVerts);
+    for (let i = 0; i < nVerts; i++) {
+      const nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2];
+      const px = verts[i * 3], py = verts[i * 3 + 1], pz = verts[i * 3 + 2];
+      let sumDot = 0, count = 0;
+
+      for (const j of neighbors[i]) {
+        const dx = verts[j * 3] - px;
+        const dy = verts[j * 3 + 1] - py;
+        const dz = verts[j * 3 + 2] - pz;
+        const dLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dLen < 1e-10) continue;
+        // dot(normal, direction_to_neighbor): positive = neighbor is above normal = concave
+        sumDot += (nx * dx + ny * dy + nz * dz) / dLen;
+        count++;
+      }
+
+      if (count > 0) {
+        // Map: negative avg (convex) → AO near 1 (bright)
+        //       positive avg (concave) → AO < 1 (dark)
+        const avgDot = sumDot / count;
+        // Clamp and invert: avgDot typically -0.3 to +0.3
+        vertexAO[i] = Math.max(0.4, Math.min(1.0, 1.0 - avgDot * 2.0));
+      } else {
+        vertexAO[i] = 1.0;
+      }
+    }
+
+    // Step 3: Rasterize per-vertex AO into UV space
+    const aoMap = new Float32Array(size * size).fill(1.0);
+    const aoCount = new Uint8Array(size * size);
+    const nUVFaces = uvFaces.length / 3;
+
+    for (let f = 0; f < nUVFaces && f < nFaces; f++) {
+      const ui0 = uvFaces[f * 3], ui1 = uvFaces[f * 3 + 1], ui2 = uvFaces[f * 3 + 2];
+      const pi0 = posFaces[f * 3], pi1 = posFaces[f * 3 + 1], pi2 = posFaces[f * 3 + 2];
+
+      const ux0 = uvCoords[ui0 * 2] * size, uy0 = uvCoords[ui0 * 2 + 1] * size;
+      const ux1 = uvCoords[ui1 * 2] * size, uy1 = uvCoords[ui1 * 2 + 1] * size;
+      const ux2 = uvCoords[ui2 * 2] * size, uy2 = uvCoords[ui2 * 2 + 1] * size;
+
+      const ao0 = vertexAO[pi0], ao1 = vertexAO[pi1], ao2 = vertexAO[pi2];
+
+      // Bounding box
+      const minX = Math.max(0, Math.floor(Math.min(ux0, ux1, ux2)));
+      const maxX = Math.min(size - 1, Math.ceil(Math.max(ux0, ux1, ux2)));
+      const minY = Math.max(0, Math.floor(Math.min(uy0, uy1, uy2)));
+      const maxY = Math.min(size - 1, Math.ceil(Math.max(uy0, uy1, uy2)));
+
+      const area = (ux1 - ux0) * (uy2 - uy0) - (ux2 - ux0) * (uy1 - uy0);
+      if (Math.abs(area) < 0.01) continue;
+      const invArea = 1.0 / area;
+
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          // Barycentric coordinates
+          const w0 = ((ux1 - x) * (uy2 - y) - (ux2 - x) * (uy1 - y)) * invArea;
+          const w1 = ((ux2 - x) * (uy0 - y) - (ux0 - x) * (uy2 - y)) * invArea;
+          const w2 = 1.0 - w0 - w1;
+          if (w0 < -0.01 || w1 < -0.01 || w2 < -0.01) continue;
+
+          const idx = y * size + x;
+          const ao = w0 * ao0 + w1 * ao1 + w2 * ao2;
+          if (aoCount[idx] === 0) {
+            aoMap[idx] = ao;
+          } else {
+            aoMap[idx] = (aoMap[idx] * aoCount[idx] + ao) / (aoCount[idx] + 1);
+          }
+          aoCount[idx]++;
+        }
+      }
+    }
+
+    // Step 4: Blur AO map slightly for smoother result
+    const blurredAO = this._boxBlurAlpha(aoMap, size, Math.max(4, Math.round(size / 256)));
+
+    // Step 5: Apply AO to blended texture
+    // Strength is modulated by photo coverage: less AO in photo regions (they have
+    // natural shadows), more AO in albedo regions (need depth cues).
+    const AO_STRENGTH = 0.20;  // Expert: subtle (0.15-0.25 range)
+    const bd = blendedData.data;
+    const pd = photoData.data;
+    let aoApplied = 0;
+
+    for (let i = 0; i < size * size; i++) {
+      const ao = blurredAO[i];
+      if (ao >= 0.99) continue; // No occlusion, skip
+
+      const photoAlpha = pd[i * 4 + 3] / 255;
+      // In photo-dominant pixels, reduce AO effect (photo has its own shadows)
+      const effectiveStrength = AO_STRENGTH * (1.0 - photoAlpha * 0.7);
+      const factor = 1.0 - effectiveStrength * (1.0 - ao);
+
+      const idx = i * 4;
+      bd[idx]     = Math.round(bd[idx] * factor);
+      bd[idx + 1] = Math.round(bd[idx + 1] * factor);
+      bd[idx + 2] = Math.round(bd[idx + 2] * factor);
+      aoApplied++;
+    }
+
+    console.log(`PhotoUploader: Baked AO applied to ${aoApplied} pixels (strength=${AO_STRENGTH})`);
   }
 
   /**
