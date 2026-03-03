@@ -406,6 +406,7 @@ export class FaceRenderer {
     // Gray-sphere calibrated exposure: ACES filmic at 1.0 over-exposes with
     // studio HDRI. 0.55 makes 0x808080 sphere render as middle gray.
     if (this.renderer) {
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
       this.renderer.toneMappingExposure = 0.55;
     }
 
@@ -499,12 +500,16 @@ export class FaceRenderer {
     // All direct lights OFF — HDRI provides specular only
     this._setPhotoLighting();
 
-    // Neutral exposure — ACES at 1.0 barely shifts midtones (~6%)
+    // Expert round 4: switch to NoToneMapping for hybrid mode.
+    // ACES desaturates/compresses emissive photo content → "processed" look.
+    // With envMapIntensity=0.02, specular values are tiny and won't clip.
+    // Keep ACES for PBR mode where it's needed for HDR highlights.
     if (this.renderer) {
+      this.renderer.toneMapping = THREE.NoToneMapping;
       this.renderer.toneMappingExposure = 1.0;
     }
 
-    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.02, roughness=0.88)');
+    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.02, roughness=0.88, NoToneMapping)');
   }
 
   /**
@@ -565,8 +570,9 @@ export class FaceRenderer {
 
     mat.needsUpdate = true;
 
-    // Reset exposure to default
+    // Reset tone mapping to default ACES
     if (this.renderer) {
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
       this.renderer.toneMappingExposure = 1.0;
     }
 

@@ -595,19 +595,32 @@ export class PhotoUploader {
           continue;
         }
 
-        // Estimate camera from the SAME fitted mesh (shape/expression from front)
-        const sideCamera = this._estimateCameraFromLandmarks(sideLandmarks, mapping, meshGen);
-        if (!sideCamera) {
+        // Estimate initial camera from the SAME fitted mesh (shape/expression from front)
+        const initialCamera = this._estimateCameraFromLandmarks(sideLandmarks, mapping, meshGen);
+        if (!initialCamera) {
           console.warn(`PhotoUploader MULTI: Camera estimation failed for ${angle}, skipping`);
           continue;
         }
 
-        console.log(`PhotoUploader MULTI: ${angle} camera: sx=${sideCamera.sx.toFixed(4)}, sy=${sideCamera.sy.toFixed(4)}`);
+        // Per-view pose refinement: keep β fixed, refine R + scale/translation
+        // via Levenberg-Marquardt to minimize reprojection error
+        console.log(`PhotoUploader MULTI: Refining ${angle} pose...`);
+        const refinedCamera = this._refineViewPose(sideLandmarks, mapping, meshGen, initialCamera);
+
+        // Quality gate: reject side views with high reprojection error
+        // (indicates the pose is unstable — don't let it corrupt the texture)
+        const finalRMSE = this._computeCameraRMSE(sideLandmarks, mapping, meshGen, refinedCamera);
+        if (finalRMSE > 0.05) {
+          console.warn(`PhotoUploader MULTI: ${angle} RMSE ${finalRMSE.toFixed(4)} > 0.05, skipping (pose unstable)`);
+          continue;
+        }
+
+        console.log(`PhotoUploader MULTI: ${angle} camera (refined): sx=${refinedCamera.sx.toFixed(4)}, sy=${refinedCamera.sy.toFixed(4)}, RMSE=${finalRMSE.toFixed(4)}`);
         views.push({
           label: angle,
           img: sideImg,
           landmarks: sideLandmarks,
-          camera: sideCamera,
+          camera: refinedCamera,
         });
       } catch (err) {
         console.warn(`PhotoUploader MULTI: Error processing ${angle}:`, err.message);
@@ -763,16 +776,21 @@ export class PhotoUploader {
     this._diagPreErosionAlpha = preErosionAlpha;
     this._diagTextureSize = size;
 
-    const ERODE_PX = Math.max(8, Math.round(size / 160));
+    // Expert round 4: increase erosion, drastically shrink softening.
+    // Wide softening (85-128px) was pulling in background → glowing halo.
+    // Move boundary inward with more erosion instead of wider blur.
+    const ERODE_PX = Math.max(12, Math.round(size / 120));   // ~17px at 2048 (was ~12)
     this._erodeAlpha(outImageData, size, ERODE_PX);
-    const FOREHEAD_EXTRA_ERODE = Math.max(8, Math.round(size / 160));
+    // Extra erosion in jawline zone (V < 0.25) and forehead/scalp (V > 0.60)
+    const JAWLINE_ERODE = Math.max(10, Math.round(size / 140));  // ~15px at 2048
+    this._erodeAlphaRegion(outImageData, size, JAWLINE_ERODE, 0.0, 0.25);
+    const FOREHEAD_EXTRA_ERODE = Math.max(10, Math.round(size / 140));
     this._erodeAlphaRegion(outImageData, size, FOREHEAD_EXTRA_ERODE, 0.60, 1.0);
 
+    // Expert round 4: reduce softening to 20-40px (was 85-128px)
     const renderMode = this._renderModeHint || 'hybrid';
-    const softenRadius = renderMode === 'hybrid'
-      ? Math.max(24, Math.round(size / 24)) : Math.max(16, Math.round(size / 32));
-    const foreheadSoftenRadius = renderMode === 'hybrid'
-      ? Math.max(40, Math.round(size / 16)) : softenRadius;
+    const softenRadius = Math.max(12, Math.round(size / 64));   // ~32px at 2048
+    const foreheadSoftenRadius = Math.max(16, Math.round(size / 48));  // ~43px at 2048
     this._softenAlphaBoundaryRegional(outImageData, size, softenRadius, foreheadSoftenRadius, 0.60);
 
     // --- Save alpha coverage debug ---
@@ -800,8 +818,10 @@ export class PhotoUploader {
     }
 
     const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
-    this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
-    this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
+    // DISABLED per expert round 4: ring artifacts likely from these passes.
+    // Reintroduce one-by-one only after clean baseline is confirmed.
+    // this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
+    // this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
 
     ctx.putImageData(blendedData, 0, 0);
     console.log('PhotoUploader MULTI: Multi-view projection complete');
@@ -1198,26 +1218,18 @@ export class PhotoUploader {
     this._diagPreErosionAlpha = preErosionAlpha;
     this._diagTextureSize = size;
 
-    const ERODE_PX = Math.max(8, Math.round(size / 160));  // ~12px at 2048
+    // Expert round 4: increase erosion, drastically shrink softening.
+    const ERODE_PX = Math.max(12, Math.round(size / 120));   // ~17px at 2048
     this._erodeAlpha(outImageData, size, ERODE_PX);
-
-    // P2 Expert: extra erosion in forehead/scalp region where photo-to-bald-head
-    // transition is most visible. FLAME UV: V≈0.65+ is forehead/scalp zone.
-    // Move the blend boundary further inward into safe skin pixels.
-    const FOREHEAD_EXTRA_ERODE = Math.max(8, Math.round(size / 160));  // ~12px extra
+    // Extra erosion in jawline (V < 0.25) and forehead/scalp (V > 0.60)
+    const JAWLINE_ERODE = Math.max(10, Math.round(size / 140));
+    this._erodeAlphaRegion(outImageData, size, JAWLINE_ERODE, 0.0, 0.25);
+    const FOREHEAD_EXTRA_ERODE = Math.max(10, Math.round(size / 140));
     this._erodeAlphaRegion(outImageData, size, FOREHEAD_EXTRA_ERODE, 0.60, 1.0);
 
-    // --- 5c-ii. Soften alpha boundaries for smooth blending transitions ---
-    // The alpha channel is the blend mask for Laplacian blending.
-    // Blurring it creates gradual photo-to-albedo transitions at all edges.
-    // P2 Expert: region-specific feather — wider in forehead, standard elsewhere
-    const renderMode = this._renderModeHint || 'hybrid';
-    const softenRadius = renderMode === 'hybrid'
-      ? Math.max(24, Math.round(size / 24))    // ~85px at 2048
-      : Math.max(16, Math.round(size / 32));    // ~64px at 2048
-    const foreheadSoftenRadius = renderMode === 'hybrid'
-      ? Math.max(40, Math.round(size / 16))    // ~128px at 2048 for forehead
-      : softenRadius;
+    // Expert round 4: reduce softening to 20-40px (was 85-128px)
+    const softenRadius = Math.max(12, Math.round(size / 64));   // ~32px at 2048
+    const foreheadSoftenRadius = Math.max(16, Math.round(size / 48));  // ~43px at 2048
     this._softenAlphaBoundaryRegional(outImageData, size, softenRadius, foreheadSoftenRadius, 0.60);
 
     // --- Save pre-fill texture for debug ---
@@ -1258,17 +1270,10 @@ export class PhotoUploader {
 
     const blendedData = this._laplacianBlend(outImageData, albedoLayer, size, 5);
 
-    // --- P3 Expert: boundary-ring color matching ---
-    // Corrects ear/temple color mismatch at the photo-to-albedo seam.
-    // Samples a narrow band on each side of the boundary and applies a
-    // local correction with radial falloff.
-    this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
-
-    // --- P4 Expert: bake subtle AO into texture for depth cues ---
-    // Emissive mode is angle-invariant → face feels flat. Instead of adding
-    // more specular (= plastic wrap), bake ambient occlusion from mesh geometry.
-    // Only affects albedo-dominant regions (photo regions have natural shadows).
-    this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
+    // DISABLED per expert round 4: ring artifacts likely from these passes.
+    // Reintroduce one-by-one only after clean baseline is confirmed.
+    // this._boundaryRingMatch(blendedData, outImageData, albedoLayer, size);
+    // this._bakeSubtleAO(blendedData, outImageData, meshGen, size);
 
     ctx.putImageData(blendedData, 0, 0);
 
@@ -1396,6 +1401,228 @@ export class PhotoUploader {
   }
 
   /**
+   * Per-view pose refinement via Levenberg-Marquardt.
+   * Keeps mesh shape (β) fixed; refines rotation (pitch/yaw/roll) with
+   * scale+translation solved linearly in the inner loop.
+   *
+   * @param {Array} landmarks  - MediaPipe landmarks for this view
+   * @param {Object} mapping   - FLAME↔MediaPipe mapping
+   * @param {Object} meshGen   - MeshGenerator with current fitted vertices
+   * @param {Object} initialCamera - Initial camera estimate {R, sx, sy, tx, ty}
+   * @param {number} maxIters  - Maximum LM iterations (default 20)
+   * @returns {Object} Refined {R, sx, sy, tx, ty} or initialCamera if refinement fails
+   */
+  _refineViewPose(landmarks, mapping, meshGen, initialCamera, maxIters = 20) {
+    const mpIndices = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords = mapping.lmk_b_coords;
+    const posFaces = meshGen.flameFaces;
+    const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
+
+    // Build 3D-2D correspondences (same as _estimateCameraFromLandmarks)
+    const pts3d = [];
+    const pts2d = [];
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (mpIdx >= landmarks.length) continue;
+      const lm = landmarks[mpIdx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const pi0 = posFaces[fi * 3], pi1 = posFaces[fi * 3 + 1], pi2 = posFaces[fi * 3 + 2];
+
+      const x = bc[0] * verts[pi0 * 3] + bc[1] * verts[pi1 * 3] + bc[2] * verts[pi2 * 3];
+      const y = bc[0] * verts[pi0 * 3 + 1] + bc[1] * verts[pi1 * 3 + 1] + bc[2] * verts[pi2 * 3 + 1];
+      const z = bc[0] * verts[pi0 * 3 + 2] + bc[1] * verts[pi1 * 3 + 2] + bc[2] * verts[pi2 * 3 + 2];
+
+      pts3d.push([x, y, z]);
+      pts2d.push([lm.x, lm.y]);
+    }
+
+    const N = pts3d.length;
+    if (N < 10) return initialCamera;
+
+    // Extract initial Euler angles from R
+    // R = Ry(yaw) * Rx(pitch) * Rz(roll)
+    // R[5] = -sin(pitch), R[2] = sin(yaw)*cos(pitch), R[8] = cos(yaw)*cos(pitch)
+    // R[3] = cos(pitch)*sin(roll), R[4] = cos(pitch)*cos(roll)
+    const R0 = initialCamera.R;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    let pitch = Math.asin(-clamp(R0[5], -1, 1));
+    let yaw   = Math.atan2(R0[2], R0[8]);
+    let roll  = Math.atan2(R0[3], R0[4]);
+
+    // Inner function: given Euler angles, solve linear system for sx/sy/tx/ty,
+    // return residuals and total squared error
+    const computeAtAngles = (p, yw, rl) => {
+      const R = this._eulerToRotationMatrix(p, yw, rl);
+      const xr = new Float64Array(N);
+      const yr = new Float64Array(N);
+      for (let i = 0; i < N; i++) {
+        const [x, y, z] = pts3d[i];
+        xr[i] = R[0] * x + R[1] * y + R[2] * z;
+        yr[i] = R[3] * x + R[4] * y + R[5] * z;
+      }
+
+      // Solve X: imgX = sx * xr + tx
+      let Axx = 0, Ax1 = 0, bx0 = 0, bx1 = 0;
+      for (let i = 0; i < N; i++) {
+        Axx += xr[i] * xr[i]; Ax1 += xr[i];
+        bx0 += xr[i] * pts2d[i][0]; bx1 += pts2d[i][0];
+      }
+      const detX = Axx * N - Ax1 * Ax1;
+      if (Math.abs(detX) < 1e-15) return null;
+      const sx = (bx0 * N - bx1 * Ax1) / detX;
+      const tx = (Axx * bx1 - Ax1 * bx0) / detX;
+
+      // Solve Y: imgY = sy * yr + ty
+      let Ayy = 0, Ay1 = 0, by0 = 0, by1 = 0;
+      for (let i = 0; i < N; i++) {
+        Ayy += yr[i] * yr[i]; Ay1 += yr[i];
+        by0 += yr[i] * pts2d[i][1]; by1 += pts2d[i][1];
+      }
+      const detY = Ayy * N - Ay1 * Ay1;
+      if (Math.abs(detY) < 1e-15) return null;
+      const sy = (by0 * N - by1 * Ay1) / detY;
+      const ty = (Ayy * by1 - Ay1 * by0) / detY;
+
+      // Residuals (2N vector)
+      const residuals = new Float64Array(2 * N);
+      let totalErr = 0;
+      for (let i = 0; i < N; i++) {
+        const ex = sx * xr[i] + tx - pts2d[i][0];
+        const ey = sy * yr[i] + ty - pts2d[i][1];
+        residuals[2 * i] = ex;
+        residuals[2 * i + 1] = ey;
+        totalErr += ex * ex + ey * ey;
+      }
+
+      return { R, sx, sy, tx, ty, residuals, error: totalErr };
+    };
+
+    let current = computeAtAngles(pitch, yaw, roll);
+    if (!current) return initialCamera;
+
+    const initialRMSE = Math.sqrt(current.error / N);
+    console.log(`PhotoUploader REFINE: Initial RMSE = ${initialRMSE.toFixed(6)} (${N} pts)`);
+
+    const eps = 1e-5;      // Numerical differentiation step
+    let lambda = 1e-3;     // LM damping factor
+
+    for (let iter = 0; iter < maxIters; iter++) {
+      // Numerical Jacobian of residuals wrt [pitch, yaw, roll] — (2N × 3)
+      const angles = [pitch, yaw, roll];
+      const J = new Float64Array(2 * N * 3);
+
+      for (let j = 0; j < 3; j++) {
+        const aPlus = [...angles]; aPlus[j] += eps;
+        const aMinus = [...angles]; aMinus[j] -= eps;
+
+        const rPlus = computeAtAngles(aPlus[0], aPlus[1], aPlus[2]);
+        const rMinus = computeAtAngles(aMinus[0], aMinus[1], aMinus[2]);
+        if (!rPlus || !rMinus) continue;
+
+        for (let i = 0; i < 2 * N; i++) {
+          J[i * 3 + j] = (rPlus.residuals[i] - rMinus.residuals[i]) / (2 * eps);
+        }
+      }
+
+      // Normal equations: (J^T J + λ diag(J^T J)) δ = -J^T r
+      const JtJ = new Float64Array(9);
+      const Jtr = new Float64Array(3);
+      for (let i = 0; i < 2 * N; i++) {
+        for (let a = 0; a < 3; a++) {
+          Jtr[a] -= J[i * 3 + a] * current.residuals[i];
+          for (let b = 0; b < 3; b++) {
+            JtJ[a * 3 + b] += J[i * 3 + a] * J[i * 3 + b];
+          }
+        }
+      }
+
+      // LM damping on diagonal
+      JtJ[0] *= (1 + lambda); JtJ[4] *= (1 + lambda); JtJ[8] *= (1 + lambda);
+      // Ensure positive diagonal
+      JtJ[0] = Math.max(JtJ[0], 1e-12);
+      JtJ[4] = Math.max(JtJ[4], 1e-12);
+      JtJ[8] = Math.max(JtJ[8], 1e-12);
+
+      // Solve 3×3 system via Cholesky
+      const delta = this._solveCholesky(JtJ.slice(), Jtr.slice(), 3);
+
+      const newPitch = pitch + delta[0];
+      const newYaw   = yaw   + delta[1];
+      const newRoll  = roll  + delta[2];
+
+      const candidate = computeAtAngles(newPitch, newYaw, newRoll);
+      if (!candidate) { lambda *= 10; continue; }
+
+      if (candidate.error < current.error) {
+        pitch = newPitch;
+        yaw = newYaw;
+        roll = newRoll;
+        current = candidate;
+        lambda = Math.max(lambda * 0.5, 1e-8);
+
+        // Convergence: step smaller than 1e-7 radians
+        const stepNorm = Math.sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+        if (stepNorm < 1e-7) break;
+      } else {
+        lambda *= 10;
+        if (lambda > 1e8) break;
+      }
+    }
+
+    const finalRMSE = Math.sqrt(current.error / N);
+    console.log(`PhotoUploader REFINE: Refined RMSE = ${finalRMSE.toFixed(6)} (improvement: ${((1 - finalRMSE / initialRMSE) * 100).toFixed(1)}%)`);
+    console.log(`PhotoUploader REFINE: Camera: sx=${current.sx.toFixed(4)}, sy=${current.sy.toFixed(4)}, tx=${current.tx.toFixed(4)}, ty=${current.ty.toFixed(4)}`);
+
+    return { R: current.R, sx: current.sx, sy: current.sy, tx: current.tx, ty: current.ty };
+  }
+
+  /**
+   * Compute RMSE of camera reprojection against MediaPipe landmarks.
+   * Used as quality gate for side views.
+   */
+  _computeCameraRMSE(landmarks, mapping, meshGen, camera) {
+    const mpIndices = mapping.landmark_indices;
+    const faceIndices = mapping.lmk_face_idx;
+    const baryCoords = mapping.lmk_b_coords;
+    const posFaces = meshGen.flameFaces;
+    const verts = meshGen._flameCurrentVertices ?? meshGen.flameTemplateVertices;
+    const { R, sx, sy, tx, ty } = camera;
+
+    let totalErr = 0;
+    let count = 0;
+    for (let i = 0; i < mpIndices.length; i++) {
+      const mpIdx = mpIndices[i];
+      if (mpIdx >= landmarks.length) continue;
+      const lm = landmarks[mpIdx];
+      if (isNaN(lm.x) || isNaN(lm.y)) continue;
+
+      const fi = faceIndices[i];
+      const bc = baryCoords[i];
+      const pi0 = posFaces[fi * 3], pi1 = posFaces[fi * 3 + 1], pi2 = posFaces[fi * 3 + 2];
+
+      const x = bc[0] * verts[pi0 * 3] + bc[1] * verts[pi1 * 3] + bc[2] * verts[pi2 * 3];
+      const y = bc[0] * verts[pi0 * 3 + 1] + bc[1] * verts[pi1 * 3 + 1] + bc[2] * verts[pi2 * 3 + 1];
+      const z = bc[0] * verts[pi0 * 3 + 2] + bc[1] * verts[pi1 * 3 + 2] + bc[2] * verts[pi2 * 3 + 2];
+
+      const xr = R[0] * x + R[1] * y + R[2] * z;
+      const yr = R[3] * x + R[4] * y + R[5] * z;
+
+      const predX = sx * xr + tx;
+      const predY = sy * yr + ty;
+      const ex = predX - lm.x;
+      const ey = predY - lm.y;
+      totalErr += ex * ex + ey * ey;
+      count++;
+    }
+
+    return count > 0 ? Math.sqrt(totalErr / count) : Infinity;
+  }
+
+  /**
    * Estimate rotation matrix from 2D-3D correspondences using Procrustes alignment.
    * Aligns the centred 3D X,Y to the centred 2D positions, then computes R.
    * @returns {Float64Array} 3x3 rotation matrix (row-major)
@@ -1433,9 +1660,9 @@ export class PhotoUploader {
     // Estimate roll from the skew between x and y
     const roll = Math.atan2(H10, H00 + 1e-10);
 
-    // Clamp to reasonable ranges for near-frontal faces
+    // Clamp to reasonable ranges (wider yaw for 45° side views)
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const yawC = clamp(yaw, -0.8, 0.8);
+    const yawC = clamp(yaw, -1.2, 1.2);     // ~69° — covers 45° side views
     const pitchC = clamp(pitch, -0.6, 0.6);
     const rollC = clamp(roll, -0.4, 0.4);
 
