@@ -458,8 +458,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         btn.textContent = 'Detecting face...';
         console.log('App: Calling generateTextureFromPhoto...');
 
-        // Generate texture from photo (uses piecewise affine warp if possible)
-        const texture = await this.photoUploader.generateTextureFromPhoto();
+        // Generate texture from photo — pass render mode for delighting adjustment
+        const renderMode = this.renderer?._photoRenderMode || 'hybrid';
+        const texture = await this.photoUploader.generateTextureFromPhoto({ renderMode });
         console.log('App: Texture generated, applying...');
 
         btn.textContent = 'Applying texture...';
@@ -929,6 +930,27 @@ You can now modify specific regions — try saying "make my nose thinner" or use
       if (this.renderer?._graySphere) this.renderer.hideGraySphere();
       else this.renderer?.showGraySphere();
     }));
+
+    // Separator
+    const sep2 = document.createElement('div');
+    sep2.style.cssText = 'height:1px;background:#444;margin:4px 0';
+    panel.appendChild(sep2);
+
+    // Render mode label
+    const modeLabel = document.createElement('div');
+    modeLabel.style.cssText = 'color:#888;font-size:10px;margin-bottom:2px';
+    modeLabel.textContent = `Mode: ${this.renderer?._photoRenderMode || 'hybrid'}`;
+    modeLabel.id = 'render-mode-label';
+    panel.appendChild(modeLabel);
+
+    // Mode toggle buttons (A/B/C comparison)
+    for (const mode of ['hybrid', 'pbr', 'emissive']) {
+      panel.appendChild(makeBtn(`🎨 ${mode}`, () => {
+        this.renderer?.setPhotoRenderMode(mode);
+        const label = document.getElementById('render-mode-label');
+        if (label) label.textContent = `Mode: ${mode}`;
+      }));
+    }
 
     // Close
     panel.appendChild(makeBtn('✕ Close Diag Panel', () => {

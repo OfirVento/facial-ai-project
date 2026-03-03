@@ -141,8 +141,9 @@ export class FaceRenderer {
     // Lights (stored for potential external tweaking)
     this.lights = {};
 
-    // Photo render mode (Phase 2: PBR is now default with HDRI)
-    this._photoRenderMode = 'pbr';        // 'pbr' | 'emissive' | 'hybrid'
+    // Photo render mode: hybrid = emissive (faithful photo) + specular (3D depth)
+    this._photoRenderMode = 'hybrid';     // 'hybrid' | 'pbr' | 'emissive'
+    this._photoTexture = null;            // Stored for mode switching
     this._photoExposure = 1.0;            // neutral default — hook for future UI
     this._photoWhiteBalance = 0xffffff;   // neutral default — hook for future UI
   }
@@ -370,6 +371,7 @@ export class FaceRenderer {
    */
   _setPbrPhotoMode(texture) {
     const mat = this.faceMaterial;
+    this._photoTexture = texture;
 
     // Clear any emissive state from previous mode
     if (mat.emissiveMap) { mat.emissiveMap.dispose(); mat.emissiveMap = null; }
@@ -416,6 +418,7 @@ export class FaceRenderer {
    */
   _setEmissivePhotoMode(texture) {
     const mat = this.faceMaterial;
+    this._photoTexture = texture;
 
     // Route photo through emissive path → bypasses BRDF 1/π darkening
     mat.emissiveMap = texture;
@@ -447,10 +450,86 @@ export class FaceRenderer {
   }
 
   /**
+   * Hybrid photo mode: emissive for faithful color + subtle PBR specular for 3D depth.
+   * Photo → emissiveMap bypasses BRDF 1/π darkening (photo shown at ~94% brightness).
+   * HDRI specular adds subtle highlights that shift with viewing angle.
+   * Expert-mandated: roughness=0.7 (not lower — reads plastic), envMap conservative.
+   */
+  _setHybridPhotoMode(texture) {
+    const mat = this.faceMaterial;
+    this._photoTexture = texture;
+
+    // Clear any existing diffuse map
+    if (mat.map) { mat.map = null; }
+
+    // Photo → emissive: bypasses BRDF 1/π, shown at full brightness
+    mat.emissiveMap = texture;
+    mat.emissive.set(0xffffff);
+    mat.emissiveIntensity = 1.0;
+
+    // Kill Lambertian diffuse entirely (photo already has baked lighting)
+    mat.color.set(0x000000);
+
+    // Expert: start conservative — roughness 0.7, envMap low (0.05-0.12)
+    mat.roughness = 0.70;           // Higher = less plastic
+    mat.metalness = 0.0;
+    mat.sheen = 0.0;                // No cloth fuzz
+    mat.clearcoat = 0.0;            // No car-paint specular
+    mat.transmission = 0;
+    mat.thickness = 0;
+
+    // Tone mapping ON — ACES is gentle on emissive values in 0-1 range
+    mat.toneMapped = true;
+    // Subtle HDRI specular: with color=black, only specular lobe responds
+    mat.envMapIntensity = 0.08;
+    mat.side = THREE.FrontSide;
+
+    mat.needsUpdate = true;
+
+    // All direct lights OFF — HDRI provides specular only
+    this._setPhotoLighting();
+
+    // Neutral exposure — ACES at 1.0 barely shifts midtones (~6%)
+    if (this.renderer) {
+      this.renderer.toneMappingExposure = 1.0;
+    }
+
+    console.log('FaceRenderer: Hybrid photo mode (emissive + specular, envMap=0.08, roughness=0.7)');
+  }
+
+  /**
+   * Switch photo render mode and re-apply stored texture in new mode.
+   * Enables instant A/B/C comparison without re-generating the texture.
+   * @param {'hybrid'|'pbr'|'emissive'} mode
+   */
+  setPhotoRenderMode(mode) {
+    if (!['hybrid', 'pbr', 'emissive'].includes(mode)) {
+      console.warn(`FaceRenderer: Unknown photo render mode "${mode}"`);
+      return;
+    }
+    this._photoRenderMode = mode;
+
+    if (this._photoTexture) {
+      switch (mode) {
+        case 'hybrid':  this._setHybridPhotoMode(this._photoTexture); break;
+        case 'pbr':     this._setPbrPhotoMode(this._photoTexture); break;
+        case 'emissive': this._setEmissivePhotoMode(this._photoTexture); break;
+      }
+      console.log(`FaceRenderer: Switched to "${mode}" photo render mode`);
+    } else {
+      console.log(`FaceRenderer: Mode set to "${mode}" (will apply on next texture load)`);
+    }
+  }
+
+  /** @returns {'hybrid'|'pbr'|'emissive'} */
+  getPhotoRenderMode() { return this._photoRenderMode; }
+
+  /**
    * Restore material to default PBR mode (for FLAME without photo).
    */
   _restoreDefaultMode() {
     const mat = this.faceMaterial;
+    this._photoTexture = null;
 
     // Clear emissive
     if (mat.emissiveMap) {
@@ -616,11 +695,11 @@ export class FaceRenderer {
 
     switch (type) {
       case 'albedo':
-        if (this._photoRenderMode === 'emissive') {
-          // Phase 10 legacy: emissive bypass (for A/B comparison)
+        if (this._photoRenderMode === 'hybrid') {
+          this._setHybridPhotoMode(texture);
+        } else if (this._photoRenderMode === 'emissive') {
           this._setEmissivePhotoMode(texture);
         } else {
-          // Phase 2: PBR photo mode with HDRI environment
           this._setPbrPhotoMode(texture);
         }
         break;

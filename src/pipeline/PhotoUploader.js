@@ -130,7 +130,9 @@ export class PhotoUploader {
    * Uses piecewise affine warp when FLAME data + MediaPipe are available,
    * otherwise falls back to a naive centre-crop.
    */
-  async generateTextureFromPhoto() {
+  async generateTextureFromPhoto(options = {}) {
+    // Store render mode hint for delighting strength adjustment
+    this._renderModeHint = options.renderMode || 'hybrid';
     if (!this.photos.front) {
       throw new Error('Front photo required');
     }
@@ -631,8 +633,10 @@ export class PhotoUploader {
     const faceBoundaryMask = this._buildFaceBoundaryMask(landmarks, srcW, srcH);
 
     // --- 5. Rasterise all visible faces (excluding inner mouth, face boundary masked) ---
+    // Pass expected winding sign from camera sx*sy for triangle inversion rejection
+    const expectedWindingSign = Math.sign(cameraParams.sx * cameraParams.sy);
     const outImageData = ctx.createImageData(size, size);
-    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask, uvDepths);
+    this._rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility, excludedFaces, faceBoundaryMask, uvDepths, expectedWindingSign);
 
     // --- 5a. Apply UV mask: clear pixels outside valid UV footprint ---
     this._applyUVMask(outImageData, size, uvMask);
@@ -1652,17 +1656,17 @@ export class PhotoUploader {
       const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
       const cosAngle = nLen > 1e-10 ? dot / nLen : 0;
 
-      // Smooth visibility: fully visible when facing camera, kill grazing angles
-      // Relaxed thresholds (Phase 8): 0.25/0.05 (was 0.3/0.1) for better ear coverage
-      if (cosAngle > 0.25) {
+      // Strict visibility: expert-mandated dot(N,V) < 0.2 → reject
+      // Tighter than Phase 8 (was 0.05-0.25) to prevent inverted silhouette triangles
+      if (cosAngle > 0.3) {
         visibility[f] = 1.0;
         visibleCount++;
-      } else if (cosAngle > 0.05) {
-        // Fade zone — gradual falloff for near-silhouette faces
-        visibility[f] = (cosAngle - 0.05) / 0.20;
+      } else if (cosAngle > 0.2) {
+        // Narrow fade zone (0.2-0.3) — sharp cutoff at silhouette
+        visibility[f] = (cosAngle - 0.2) / 0.10;
         visibleCount++;
       } else {
-        // Grazing or back-facing — kill completely
+        // Below 0.2 — reject (grazing/back-facing, causes swirl artifacts)
         visibility[f] = 0;
       }
     }
@@ -2418,9 +2422,10 @@ export class PhotoUploader {
     // Use a mild strength factor to avoid over-flattening.
     // Scale by photo brightness: well-lit photos need less delighting (shadows already subtle).
     // Dark photos need more correction. Also adaptive per-pixel for under-eye preservation.
-    // Reduced delighting: with HDRI-only lighting (no direct lights), the photo's
-    // baked shading is less problematic. Over-delighting destroys skin color fidelity.
-    const MAX_STRENGTH = 0.12;
+    // Mode-aware delighting: hybrid needs minimal correction (photo shadows ARE
+    // the diffuse shading in emissive mode). PBR needs more to prevent double-shadowing.
+    const renderMode = this._renderModeHint || 'hybrid';
+    const MAX_STRENGTH = renderMode === 'hybrid' ? 0.04 : 0.12;
     const lumScale = Math.min(1.0, Math.max(0.2, (180 - avgLum) / 100));
     const BASE_STRENGTH = MAX_STRENGTH * lumScale;
     console.log(`PhotoUploader DENSE: Delight strength scaled: avgLum=${avgLum.toFixed(1)}, lumScale=${lumScale.toFixed(2)}, BASE_STRENGTH=${BASE_STRENGTH.toFixed(3)}`);
@@ -2706,14 +2711,24 @@ export class PhotoUploader {
     }
 
     // --- Compute color correction: match FLAME albedo to photo skin tone ---
-    // Sample both photo pixels (alpha=255) and their corresponding FLAME albedo
-    // to compute a color ratio for seamless blending.
+    // Expert fix: filter sampling to reject shadows, desaturated, and extreme pixels
+    // (same logic as _prepareAlbedoLayer to prevent green/gray contamination)
     let photoR = 0, photoG = 0, photoB = 0;
     let albR = 0, albG = 0, albB = 0;
     let sampleCount = 0;
 
     for (let i = 0; i < total; i++) {
       if (data[i * 4 + 3] !== 255) continue; // only fully-mapped photo pixels
+
+      // Expert fix: luminance filter — reject shadows and highlights
+      const pr = data[i * 4], pg = data[i * 4 + 1], pb = data[i * 4 + 2];
+      const pLum = pr * 0.2126 + pg * 0.7152 + pb * 0.0722;
+      if (pLum < 60 || pLum > 220) continue;
+
+      // Expert fix: saturation filter — reject near-gray (shadow contamination)
+      const maxC = Math.max(pr, pg, pb);
+      const minC = Math.min(pr, pg, pb);
+      if (maxC > 10 && (maxC - minC) / maxC < 0.05) continue;
 
       const px = i % size;
       const py = Math.floor(i / size);
@@ -2725,9 +2740,9 @@ export class PhotoUploader {
       const ay0 = Math.max(0, Math.min(Math.floor(v * albedoSize), albedoSize - 1));
       const ai = (ay0 * albedoSize + ax0) * 3;
 
-      photoR += data[i * 4];
-      photoG += data[i * 4 + 1];
-      photoB += data[i * 4 + 2];
+      photoR += pr;
+      photoG += pg;
+      photoB += pb;
       albR += albedo[ai];
       albG += albedo[ai + 1];
       albB += albedo[ai + 2];
@@ -3110,15 +3125,15 @@ export class PhotoUploader {
 
     const albedoRes = meshGen.albedoResolution || 512;
 
-    // Compute robust color correction using trimmed mean
-    // Sample from forehead/cheek/chin/ear regions for comprehensive coverage.
-    // Landmarks: 8 (nose bridge), 10 (forehead), 117 (right cheek), 346 (left cheek),
-    //            152 (chin), 234 (left ear/tragus), 454 (right ear/tragus)
+    // Compute robust color correction using safe, central skin landmarks only.
+    // Expert fix: removed chin (152), jaw left (234), jaw right (454) —
+    // these sample jaw shadow, hair edges, neck which contaminate with green/gray.
+    // Safe landmarks: upper forehead, nose bridge/tip, upper cheeks near nose.
 
     // Build UV-space bounding boxes for sampling regions
     let sampleBoxes = null;
     if (landmarks && mapping) {
-      const SAMPLE_MP = [8, 10, 117, 346, 152, 234, 454];
+      const SAMPLE_MP = [10, 8, 6, 117, 346, 101, 330];
       const uvCoords = meshGen.flameUVCoords;
       const uvFaces = meshGen.flameUVFaces;
       const mpIndices = mapping.landmark_indices;
@@ -3172,13 +3187,21 @@ export class PhotoUploader {
       const ay = Math.min(albedoRes - 1, Math.floor(v * albedoRes));
       const ai = (ay * albedoRes + ax) * 3;
 
-      // Filter out extreme luminance (shadows, highlights, artifacts)
+      // Expert fix: tighter luminance filter (was 20-240, too permissive)
+      // Rejects dark shadows and blown highlights that carry color casts
       const pLum = pd[i * 4] * 0.2126 + pd[i * 4 + 1] * 0.7152 + pd[i * 4 + 2] * 0.0722;
       const aLum = albedo[ai] * 0.2126 + albedo[ai + 1] * 0.7152 + albedo[ai + 2] * 0.0722;
-      if (pLum < 20 || pLum > 240 || aLum < 20 || aLum > 240) continue;
+      if (pLum < 60 || pLum > 220 || aLum < 30 || aLum > 230) continue;
+
+      // Expert fix: reject near-gray pixels (low saturation = shadow contamination)
+      const pr = pd[i * 4], pg = pd[i * 4 + 1], pb = pd[i * 4 + 2];
+      const maxC = Math.max(pr, pg, pb);
+      const minC = Math.min(pr, pg, pb);
+      const sat = maxC > 10 ? (maxC - minC) / maxC : 0;
+      if (sat < 0.05) continue;  // Skip desaturated pixels (shadow/background)
 
       samples.push({
-        pr: pd[i * 4], pg: pd[i * 4 + 1], pb: pd[i * 4 + 2],
+        pr, pg, pb,
         ar: albedo[ai], ag: albedo[ai + 1], ab: albedo[ai + 2],
         lum: pLum
       });
@@ -3215,6 +3238,18 @@ export class PhotoUploader {
     const crG = Math.max(0.3, Math.min(3.0, median(ratiosG)));
     const crB = Math.max(0.3, Math.min(3.0, median(ratiosB)));
     console.log(`Albedo color correction (MEDIAN): R=${crR.toFixed(3)}, G=${crG.toFixed(3)}, B=${crB.toFixed(3)}, samples=${samples.length}`);
+
+    // Expert diagnostic: check for sampling contamination via variance
+    if (samples.length > 20) {
+      const avgR = samples.reduce((s, x) => s + x.pr, 0) / samples.length;
+      const avgG = samples.reduce((s, x) => s + x.pg, 0) / samples.length;
+      const stdR = Math.sqrt(samples.reduce((s, x) => s + (x.pr - avgR) ** 2, 0) / samples.length);
+      const stdG = Math.sqrt(samples.reduce((s, x) => s + (x.pg - avgG) ** 2, 0) / samples.length);
+      console.log(`Albedo sampling DIAG: avgRGB=(${avgR.toFixed(0)},${avgG.toFixed(0)}), stdR=${stdR.toFixed(1)}, stdG=${stdG.toFixed(1)}`);
+      if (stdR > 40 || stdG > 40) {
+        console.warn('Albedo sampling WARNING: HIGH variance — possible contamination from shadow/hair/background');
+      }
+    }
 
     // Phase 10b diagnostic: compare photo vs corrected albedo luminance + per-channel RGB
     const avgPhotoR = samples.reduce((s, x) => s + x.pr, 0) / samples.length;
@@ -3370,7 +3405,7 @@ export class PhotoUploader {
    * Rasterise all FLAME UV faces, sampling the source photo via
    * TPS-interpolated per-vertex image coordinates.
    */
-  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null, faceBoundaryMask = null, uvDepths = null) {
+  _rasterizeMeshFaces(outImageData, size, uvCoords, uvFaces, uvImgCoords, srcData, srcW, srcH, faceVisibility = null, excludedFaces = null, faceBoundaryMask = null, uvDepths = null, expectedWindingSign = 0) {
     const out = outImageData.data;
     const nFaces = uvFaces.length / 3;
 
@@ -3402,11 +3437,18 @@ export class PhotoUploader {
       const ix1 = uvImgCoords[vi1 * 2], iy1 = uvImgCoords[vi1 * 2 + 1];
       const ix2 = uvImgCoords[vi2 * 2], iy2 = uvImgCoords[vi2 * 2 + 1];
 
-      // --- Triangle inversion check: skip degenerate (near-zero area) projected triangles ---
-      // Note: with anisotropic weak-perspective, sy is often negative (Y-flip),
-      // so signed area sign depends on sign(sx*sy). We only skip truly degenerate triangles.
+      // --- Triangle inversion check: reject degenerate + inverted triangles ---
+      // With anisotropic weak-perspective, sy is often negative (Y-flip).
+      // Expected winding sign = sign(sx*sy). If a triangle's projected signed area
+      // doesn't match, it's inverted (inside-out) and causes swirl/smear artifacts.
       const signedArea2D = (ix1 - ix0) * (iy2 - iy0) - (ix2 - ix0) * (iy1 - iy0);
-      if (Math.abs(signedArea2D) < 1e-12) {
+      // 1) Reject degenerate triangles (near-zero area)
+      if (Math.abs(signedArea2D) < 1e-6) {
+        invertedSkipped++;
+        continue;
+      }
+      // 2) Reject inverted triangles: projected winding must match expected sign(sx*sy)
+      if (expectedWindingSign !== 0 && Math.sign(signedArea2D) !== expectedWindingSign) {
         invertedSkipped++;
         continue;
       }
