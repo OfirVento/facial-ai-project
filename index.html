@@ -104,6 +104,30 @@
         </div>
       </div>
 
+      <!-- Treatment Predictor -->
+      <div id="treatment-section" class="panel-section">
+        <div class="panel-header">
+          <span>💉 Treatment Predictor</span>
+        </div>
+        <div class="treatment-controls">
+          <select id="treatment-select" class="treatment-select" style="width:100%;padding:6px 8px;background:var(--bg-input);color:var(--text-primary);border:1px solid var(--border-light);border-radius:var(--radius-xs);font-family:var(--font);font-size:12px;margin-bottom:8px;">
+            <option value="">— Select Treatment —</option>
+          </select>
+          <div id="treatment-volume-row" style="display:none;margin-bottom:8px;">
+            <label style="font-size:11px;color:var(--text-secondary);display:flex;justify-content:space-between;margin-bottom:4px;">
+              <span>Volume</span>
+              <span id="treatment-volume-label">1.0 ml</span>
+            </label>
+            <input type="range" id="treatment-volume" min="0" max="100" value="50" style="width:100%;">
+          </div>
+          <div id="treatment-confidence" style="display:none;font-size:11px;margin-bottom:8px;padding:4px 8px;background:var(--bg-card);border-radius:var(--radius-xs);"></div>
+          <div style="display:flex;gap:6px;">
+            <button id="treatment-preview-btn" class="btn-sm" disabled style="flex:1;padding:6px;font-size:12px;background:var(--accent-dim);color:white;border:none;border-radius:var(--radius-xs);cursor:pointer;font-family:var(--font);">Preview</button>
+            <button id="treatment-reset-btn" class="btn-sm" disabled style="flex:1;padding:6px;font-size:12px;background:var(--bg-card);color:var(--text-secondary);border:1px solid var(--border-light);border-radius:var(--radius-xs);cursor:pointer;font-family:var(--font);">Reset</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Versions -->
       <div id="versions-section" class="panel-section compact">
         <div class="panel-header">

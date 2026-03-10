@@ -14,6 +14,7 @@ import { ConversationDirector } from './agents/ConversationDirector.js';
 import { PhotoUploader } from './pipeline/PhotoUploader.js';
 import { MediaPipeBridge } from './engine/MediaPipeBridge.js';
 import { HDRIManager } from './engine/HDRIManager.js';
+import { FaceDNA } from './data/FaceDNA.js';
 
 class FacialAIProject {
   constructor() {
@@ -43,6 +44,9 @@ class FacialAIProject {
     this.activeRegionTab = 'all';
     this.isVoiceMode = false;
     this.comparisonMode = false;
+
+    // FaceDNA — digital face identity
+    this.currentFaceDNA = null;
 
     // Director (initialized after all agents ready)
     this.director = null;
@@ -95,6 +99,7 @@ class FacialAIProject {
     // Setup all UI
     this._setupUploadUI();
     this._setupControlsUI();
+    this._setupTreatmentUI();
     this._setupChatUI();
     this._setupTopBarUI();
     this._setupViewportUI();
@@ -428,6 +433,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
       });
     });
 
+    // ===== Guided Capture Button =====
+    this._setupGuidedCaptureButton();
+
     // Generate button
     document.getElementById('generate-btn')?.addEventListener('click', async () => {
       const btn = document.getElementById('generate-btn');
@@ -494,6 +502,28 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         // Expert diagnostics: toggle buttons available but NOT auto-shown
         this._addExpertDiagButtons(this.photoUploader);
 
+        // ===== FaceDNA: capture digital face identity =====
+        try {
+          this.currentFaceDNA = FaceDNA.fromCurrentState(
+            this.meshGenerator,
+            this.photoUploader,
+            this.mediaPipeBridge
+          );
+          const summary = this.currentFaceDNA.getSummary();
+          console.log('App: FaceDNA created —', summary);
+          this._addMessage('system',
+            `FaceDNA captured: ${summary.views} view(s), ` +
+            `shape=${summary.hasShape ? '✓' : '✗'}, ` +
+            `texture=${summary.hasTexture ? '✓' : '✗'}, ` +
+            `${Object.keys(summary.measurements).length} measurements`
+          );
+          // Enable FaceDNA buttons
+          document.getElementById('facedna-save-btn')?.removeAttribute('disabled');
+          document.getElementById('facedna-export-btn')?.removeAttribute('disabled');
+        } catch (fdnaErr) {
+          console.warn('App: FaceDNA creation failed:', fdnaErr.message);
+        }
+
         this._addMessage('system', 'Photo texture projected onto 3D model.');
         btn.textContent = '✓ Generated';
         console.log('App: Generation complete');
@@ -554,6 +584,279 @@ You can now modify specific regions — try saying "make my nose thinner" or use
     });
 
     this._renderRegionControls();
+  }
+
+  /**
+   * Setup the "Guided Capture" button in the upload section.
+   * Dynamically imports CaptureGuide on click for code splitting.
+   */
+  _setupGuidedCaptureButton() {
+    const genBtn = document.getElementById('generate-btn');
+    if (!genBtn) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'guided-capture-btn';
+    btn.className = 'btn-secondary';
+    btn.textContent = '📸 Guided Capture';
+    btn.style.cssText = 'margin: 0 12px 8px; width: calc(100% - 24px); padding: 8px 16px; font-size: 13px; background: var(--bg-card); color: var(--accent-light); border: 1px solid var(--accent-dim); border-radius: var(--radius-sm); cursor: pointer; font-family: var(--font); transition: all 0.2s ease;';
+
+    // Insert before the generate button's parent or before generate-btn
+    genBtn.parentNode.insertBefore(btn, genBtn);
+
+    btn.addEventListener('mouseenter', () => {
+      btn.style.background = 'var(--accent-dim)';
+      btn.style.color = 'white';
+    });
+    btn.addEventListener('mouseleave', () => {
+      btn.style.background = 'var(--bg-card)';
+      btn.style.color = 'var(--accent-light)';
+    });
+
+    btn.addEventListener('click', async () => {
+      btn.textContent = 'Loading...';
+      btn.disabled = true;
+
+      try {
+        // Dynamic import for code splitting
+        const { CaptureGuide } = await import('./capture/CaptureGuide.js');
+
+        // Lazy-init MediaPipeBridge
+        if (!this.mediaPipeBridge) {
+          this.mediaPipeBridge = new MediaPipeBridge();
+        }
+        if (!this.mediaPipeBridge.isReady) {
+          btn.textContent = 'Loading face AI...';
+          await this.mediaPipeBridge.init();
+        }
+
+        const guide = new CaptureGuide({
+          photoUploader: this.photoUploader,
+          mediaPipeBridge: this.mediaPipeBridge,
+          onComplete: async (captures) => {
+            // Set photos on PhotoUploader
+            for (const [angle, capture] of Object.entries(captures)) {
+              if (capture && capture.blob) {
+                const file = new File([capture.blob], `guided_${angle}.jpg`, { type: 'image/jpeg' });
+                await this.photoUploader.setPhoto(angle, file);
+
+                // Store quality score on photo metadata
+                if (this.photoUploader.photos[angle]) {
+                  this.photoUploader.photos[angle]._qualityScore = capture.quality?.overallScore / 100 || 1.0;
+                }
+
+                // Update upload slot UI
+                const slot = document.querySelector(`.upload-slot[data-angle="${angle}"]`);
+                if (slot) {
+                  const existing = slot.querySelector('.upload-preview');
+                  if (existing) existing.remove();
+                  const img = document.createElement('img');
+                  img.className = 'upload-preview';
+                  img.src = capture.dataUrl;
+                  slot.appendChild(img);
+                  slot.classList.add('has-photo');
+                }
+              }
+            }
+
+            // Enable generate button
+            const status = this.photoUploader.getStatus();
+            const generateBtn = document.getElementById('generate-btn');
+            if (generateBtn) {
+              generateBtn.disabled = !status.canReconstruct;
+              generateBtn.textContent = 'Generate 3D Model';
+            }
+            this._addMessage('system', '📸 Guided capture complete. Click "Generate 3D Model" to create 3D face.');
+          },
+          onCancel: () => {
+            this._addMessage('system', 'Guided capture cancelled.');
+          },
+        });
+
+        guide.start();
+      } catch (err) {
+        console.error('Guided capture error:', err);
+        this._addMessage('system', `Guided capture failed: ${err.message}`);
+      } finally {
+        btn.textContent = '📸 Guided Capture';
+        btn.disabled = false;
+      }
+    });
+  }
+
+  /**
+   * Setup the Treatment Predictor UI panel.
+   * Dynamically imports GeometryPredictor and ConfidenceScorer on use.
+   */
+  _setupTreatmentUI() {
+    const select = document.getElementById('treatment-select');
+    const volumeRow = document.getElementById('treatment-volume-row');
+    const volumeSlider = document.getElementById('treatment-volume');
+    const volumeLabel = document.getElementById('treatment-volume-label');
+    const confidenceEl = document.getElementById('treatment-confidence');
+    const previewBtn = document.getElementById('treatment-preview-btn');
+    const resetBtn = document.getElementById('treatment-reset-btn');
+
+    if (!select) return;
+
+    // Lazy-loaded modules
+    let GeometryPredictor = null;
+    let ConfidenceScorer = null;
+    let currentTreatment = null;
+
+    // Populate dropdown on first click (lazy load)
+    select.addEventListener('focus', async () => {
+      if (GeometryPredictor) return; // already loaded
+
+      try {
+        const gpMod = await import('./prediction/GeometryPredictor.js');
+        const csMod = await import('./prediction/ConfidenceScorer.js');
+        GeometryPredictor = gpMod.GeometryPredictor;
+        ConfidenceScorer = csMod.ConfidenceScorer;
+
+        // Populate options grouped by category
+        const byCategory = GeometryPredictor.getByCategory();
+        select.innerHTML = '<option value="">— Select Treatment —</option>';
+        for (const [category, treatments] of Object.entries(byCategory)) {
+          const group = document.createElement('optgroup');
+          group.label = category;
+          for (const t of treatments) {
+            const opt = document.createElement('option');
+            opt.value = t.id;
+            opt.textContent = t.label;
+            group.appendChild(opt);
+          }
+          select.appendChild(group);
+        }
+      } catch (err) {
+        console.error('Failed to load treatment modules:', err);
+      }
+    }, { once: true });
+
+    // On treatment selection change
+    select.addEventListener('change', () => {
+      const id = select.value;
+      if (!id || !GeometryPredictor) {
+        volumeRow.style.display = 'none';
+        confidenceEl.style.display = 'none';
+        previewBtn.disabled = true;
+        currentTreatment = null;
+        return;
+      }
+
+      const treatment = GeometryPredictor.treatments[id];
+      if (!treatment) return;
+
+      currentTreatment = { id, ...treatment };
+
+      // Show volume slider
+      volumeRow.style.display = 'block';
+      previewBtn.disabled = false;
+
+      // Configure slider range
+      const maxVol = treatment.maxVolume || 5;
+      const defaultVol = treatment.defaultVolume || 1;
+      const unit = treatment.unit || 'ml';
+
+      volumeSlider.min = 0;
+      volumeSlider.max = 100;
+      volumeSlider.value = Math.round((defaultVol / maxVol) * 100);
+      volumeLabel.textContent = `${defaultVol.toFixed(1)} ${unit}`;
+
+      // Show confidence
+      this._updateTreatmentConfidence(id, defaultVol, maxVol);
+    });
+
+    // Volume slider change
+    volumeSlider?.addEventListener('input', () => {
+      if (!currentTreatment || !GeometryPredictor) return;
+      const maxVol = currentTreatment.maxVolume || 5;
+      const unit = currentTreatment.unit || 'ml';
+      const volume = (volumeSlider.value / 100) * maxVol;
+      volumeLabel.textContent = `${volume.toFixed(1)} ${unit}`;
+      this._updateTreatmentConfidence(currentTreatment.id, volume, maxVol);
+    });
+
+    // Preview button
+    previewBtn?.addEventListener('click', async () => {
+      if (!currentTreatment || !GeometryPredictor || !this.renderer) return;
+
+      const maxVol = currentTreatment.maxVolume || 5;
+      const volume = (volumeSlider.value / 100) * maxVol;
+
+      const result = GeometryPredictor.predict(currentTreatment.id, { volume });
+      if (!result) return;
+
+      // Apply morph state via renderer with animation
+      if (this.meshData?.regions) {
+        // Merge with current morph state
+        const treatmentMorphState = { ...this.morphState, ...result.morphState };
+
+        // Use animated morph transition (500ms smooth lerp)
+        if (this.renderer.animateMorphTo) {
+          this.renderer.animateMorphTo(treatmentMorphState, this.meshData.regions, {
+            duration: 500,
+          });
+        } else {
+          this.renderer.applyMorphState(treatmentMorphState, this.meshData.regions);
+        }
+
+        // Store in FaceDNA if available
+        if (this.currentFaceDNA) {
+          const unit = currentTreatment.unit || 'ml';
+          this.currentFaceDNA.addTreatment(
+            result.morphState,
+            [`${currentTreatment.label} (${volume.toFixed(1)} ${unit})`],
+            `Predicted via GeometryPredictor`
+          );
+        }
+
+        resetBtn.disabled = false;
+        this._addMessage('system',
+          `💉 Applied ${currentTreatment.label} at ${volume.toFixed(1)} ${currentTreatment.unit || 'ml'}`
+        );
+      }
+    });
+
+    // Reset button
+    resetBtn?.addEventListener('click', () => {
+      if (this.renderer) {
+        this.renderer.resetDeformation();
+        // Re-apply existing morph state without treatment
+        if (this.meshData?.regions && Object.keys(this.morphState).length > 0) {
+          this.renderer.applyMorphState(this.morphState, this.meshData.regions);
+        }
+        resetBtn.disabled = true;
+        this._addMessage('system', 'Treatment preview reset.');
+      }
+    });
+  }
+
+  /**
+   * Update the treatment confidence display.
+   */
+  _updateTreatmentConfidence(treatmentId, volume, maxVolume) {
+    const confidenceEl = document.getElementById('treatment-confidence');
+    if (!confidenceEl) return;
+
+    // Dynamic import already done by _setupTreatmentUI
+    import('./prediction/ConfidenceScorer.js').then(({ ConfidenceScorer }) => {
+      const captureQuality = this.currentFaceDNA?.capture?.views?.[0]?.qualityScore ?? 1.0;
+      const hasMultiView = (this.currentFaceDNA?.capture?.views?.length || 0) > 1;
+
+      const conf = ConfidenceScorer.score(treatmentId, {
+        volume,
+        maxVolume,
+        captureQuality,
+        hasMultiView,
+      });
+
+      confidenceEl.style.display = 'block';
+      confidenceEl.innerHTML = `
+        <span style="color:${ConfidenceScorer.colorForLevel(conf.level)}">
+          Confidence: ${Math.round(conf.score * 100)}% (${conf.level})
+        </span>
+      `;
+    });
   }
 
   _renderRegionControls() {
@@ -730,6 +1033,9 @@ You can now modify specific regions — try saying "make my nose thinner" or use
       this._generateReport();
     });
 
+    // ===== FaceDNA buttons (injected dynamically) =====
+    this._setupFaceDNAButtons();
+
     // Mode tabs
     document.querySelectorAll('.mode-tab').forEach(tab => {
       tab.addEventListener('click', (e) => {
@@ -745,6 +1051,193 @@ You can now modify specific regions — try saying "make my nose thinner" or use
         if (e.key === 'y') { e.preventDefault(); this.redo(); }
       }
     });
+  }
+
+  // ============================================================
+  // FACEDNA UI
+  // ============================================================
+
+  _setupFaceDNAButtons() {
+    const topBarRight = document.querySelector('.top-bar-right');
+    if (!topBarRight) return;
+
+    // Insert FaceDNA button group before the report button
+    const reportBtn = document.getElementById('report-btn');
+    const facednaGroup = document.createElement('span');
+    facednaGroup.className = 'facedna-btn-group';
+    facednaGroup.style.cssText = 'display:inline-flex;gap:4px;margin-left:8px;border-left:1px solid #444;padding-left:8px;';
+
+    facednaGroup.innerHTML = `
+      <button class="top-btn" id="facedna-save-btn" disabled title="Save FaceDNA to browser">🧬 Save DNA</button>
+      <button class="top-btn" id="facedna-export-btn" disabled title="Export .fdna file">📥 Export</button>
+      <button class="top-btn" id="facedna-import-btn" title="Import .fdna file">📤 Import</button>
+      <button class="top-btn" id="facedna-load-btn" title="Load saved FaceDNA">📂 Load DNA</button>
+      <input type="file" id="facedna-file-input" accept=".fdna" style="display:none">
+    `;
+
+    if (reportBtn) {
+      topBarRight.insertBefore(facednaGroup, reportBtn.nextSibling);
+    } else {
+      topBarRight.appendChild(facednaGroup);
+    }
+
+    // -- Save to IndexedDB --
+    document.getElementById('facedna-save-btn')?.addEventListener('click', async () => {
+      if (!this.currentFaceDNA) {
+        this._addMessage('system', 'No FaceDNA to save. Generate a 3D model from a photo first.');
+        return;
+      }
+      try {
+        // Record current morph state as treatment if there are changes
+        if (Object.keys(this.morphState).length > 0) {
+          const hasChanges = Object.values(this.morphState).some(s =>
+            s.inflate || s.translateX || s.translateY || s.translateZ
+          );
+          if (hasChanges) {
+            this.currentFaceDNA.addTreatment(this.morphState, ['morphing'], 'Auto-saved morph state');
+          }
+        }
+
+        await this.currentFaceDNA.saveToDB();
+        this._addMessage('system', `FaceDNA saved (id: ${this.currentFaceDNA.id.slice(0, 12)}...)`);
+      } catch (err) {
+        this._addMessage('system', `FaceDNA save failed: ${err.message}`);
+      }
+    });
+
+    // -- Export as .fdna file --
+    document.getElementById('facedna-export-btn')?.addEventListener('click', () => {
+      if (!this.currentFaceDNA) {
+        this._addMessage('system', 'No FaceDNA to export. Generate a 3D model from a photo first.');
+        return;
+      }
+      this.currentFaceDNA.downloadFile();
+      this._addMessage('system', 'FaceDNA exported as .fdna file.');
+    });
+
+    // -- Import .fdna file --
+    document.getElementById('facedna-import-btn')?.addEventListener('click', () => {
+      document.getElementById('facedna-file-input')?.click();
+    });
+
+    document.getElementById('facedna-file-input')?.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      try {
+        const dna = await FaceDNA.fromFile(file);
+        this.currentFaceDNA = dna;
+
+        // Apply geometry if we have FLAME loaded
+        if (this.flameLoaded && dna.geometry.shapeParams) {
+          dna.applyGeometry(this.meshGenerator);
+        }
+
+        // Apply texture
+        if (dna.texture.albedoDataUrl && this.renderer) {
+          await this.renderer.loadTexture(dna.texture.albedoDataUrl, 'albedo', { flipY: false });
+        }
+
+        const summary = dna.getSummary();
+        this._addMessage('system',
+          `FaceDNA imported: ${summary.views} view(s), ` +
+          `${summary.treatmentCount} treatment(s), ` +
+          `${Object.keys(summary.measurements).length} measurements`
+        );
+
+        // Enable buttons
+        document.getElementById('facedna-save-btn')?.removeAttribute('disabled');
+        document.getElementById('facedna-export-btn')?.removeAttribute('disabled');
+      } catch (err) {
+        this._addMessage('system', `FaceDNA import failed: ${err.message}`);
+      }
+
+      // Reset file input so same file can be re-selected
+      e.target.value = '';
+    });
+
+    // -- Load from IndexedDB --
+    document.getElementById('facedna-load-btn')?.addEventListener('click', async () => {
+      try {
+        const entries = await FaceDNA.listFromDB();
+        if (entries.length === 0) {
+          this._addMessage('system', 'No saved FaceDNA records found.');
+          return;
+        }
+
+        // Show a simple selection in chat
+        const entryList = entries
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+          .slice(0, 10)
+          .map((e, i) => `${i + 1}. ${e.id.slice(0, 12)}... (${new Date(e.createdAt).toLocaleDateString()}, ${e.views} views, texture: ${e.hasTexture ? '✓' : '✗'})`)
+          .join('\n');
+
+        this._addMessage('system',
+          `Saved FaceDNA records:\n\n${entryList}\n\nClick a record to load:`
+        );
+
+        // Create clickable buttons for each entry
+        const chatMessages = document.querySelector('.chat-messages');
+        const lastMsg = chatMessages?.lastElementChild;
+        if (lastMsg) {
+          const btnContainer = document.createElement('div');
+          btnContainer.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;';
+
+          entries.slice(0, 10).forEach((entry) => {
+            const loadBtn = document.createElement('button');
+            loadBtn.style.cssText = 'padding:4px 8px;font-size:11px;background:#234;color:#8cf;border:1px solid #456;border-radius:4px;cursor:pointer;';
+            loadBtn.textContent = `${entry.id.slice(0, 8)}… (${new Date(entry.createdAt).toLocaleDateString()})`;
+            loadBtn.addEventListener('click', async () => {
+              await this._loadFaceDNA(entry.id);
+              btnContainer.remove();
+            });
+            btnContainer.appendChild(loadBtn);
+          });
+
+          lastMsg.appendChild(btnContainer);
+        }
+      } catch (err) {
+        this._addMessage('system', `Failed to list FaceDNA records: ${err.message}`);
+      }
+    });
+  }
+
+  /**
+   * Load a FaceDNA from IndexedDB and apply to the current scene.
+   */
+  async _loadFaceDNA(id) {
+    try {
+      const dna = await FaceDNA.loadFromDB(id);
+      if (!dna) {
+        this._addMessage('system', `FaceDNA record ${id} not found.`);
+        return;
+      }
+
+      this.currentFaceDNA = dna;
+
+      // Apply geometry
+      if (this.flameLoaded && dna.geometry.shapeParams) {
+        dna.applyGeometry(this.meshGenerator);
+      }
+
+      // Apply texture
+      if (dna.texture.albedoDataUrl && this.renderer) {
+        await this.renderer.loadTexture(dna.texture.albedoDataUrl, 'albedo', { flipY: false });
+      }
+
+      const summary = dna.getSummary();
+      this._addMessage('system',
+        `FaceDNA loaded: ${summary.views} view(s), ` +
+        `${summary.treatmentCount} treatment(s). ` +
+        `Symmetry: ${summary.symmetry?.overall !== undefined ? (summary.symmetry.overall * 100).toFixed(1) + '%' : 'N/A'}`
+      );
+
+      // Enable buttons
+      document.getElementById('facedna-save-btn')?.removeAttribute('disabled');
+      document.getElementById('facedna-export-btn')?.removeAttribute('disabled');
+    } catch (err) {
+      this._addMessage('system', `FaceDNA load failed: ${err.message}`);
+    }
   }
 
   _setupViewportUI() {

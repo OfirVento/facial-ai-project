@@ -107,6 +107,12 @@ export class FaceRenderer {
     this.faceMaterial = null;
     this.originalPositions = null; // Float32Array clone
 
+    // SSS post-processing (null until enabled)
+    this._sssEffect = null;
+
+    // Morph animation state
+    this._morphAnimation = null;
+
     // Comparison overlay
     this._ghostMesh = null;
     this._comparisonEnabled = false;
@@ -166,6 +172,18 @@ export class FaceRenderer {
   // -- renderer -----------------------------------------------------------
 
   _initRenderer() {
+    // WebGPU readiness check — Three.js v0.170+ has experimental WebGPURenderer.
+    // Currently fall back to WebGL which is universally supported.
+    // When WebGPU is stable, the commented block below activates automatically.
+    //
+    // if (navigator.gpu && THREE.WebGPURenderer) {
+    //   this.renderer = new THREE.WebGPURenderer({ antialias: true });
+    //   await this.renderer.init();
+    //   this._isWebGPU = true;
+    //   console.log('FaceRenderer: Using WebGPU renderer');
+    // }
+
+    this._isWebGPU = false;
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       alpha: false,
@@ -179,6 +197,14 @@ export class FaceRenderer {
     this.renderer.toneMappingExposure = 1.0;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.container.appendChild(this.renderer.domElement);
+
+    // Log GPU capabilities for debugging
+    const gl = this.renderer.getContext();
+    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+    if (debugInfo) {
+      console.log('FaceRenderer: GPU:', gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL));
+    }
+    console.log(`FaceRenderer: WebGPU available: ${!!navigator.gpu}, using: ${this._isWebGPU ? 'WebGPU' : 'WebGL'}`);
   }
 
   // -- scene --------------------------------------------------------------
@@ -1356,7 +1382,13 @@ export class FaceRenderer {
     const loop = () => {
       this._rafId = requestAnimationFrame(loop);
       this._update();
-      this.renderer.render(this.scene, this.camera);
+
+      // Use SSS composer if enabled, otherwise standard render
+      if (this._sssEffect && this._sssEffect.enabled) {
+        this._sssEffect.render();
+      } else {
+        this.renderer.render(this.scene, this.camera);
+      }
     };
     loop();
   }
@@ -1374,6 +1406,11 @@ export class FaceRenderer {
     // Expression animation mixer
     if (this._expressionMixer) {
       this._expressionMixer.update(dt);
+    }
+
+    // Morph animation (treatment preview lerp)
+    if (this._morphAnimation) {
+      this._updateMorphAnimation();
     }
 
     // Keep background plane facing the camera
@@ -1533,6 +1570,11 @@ export class FaceRenderer {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+
+    // Resize SSS render targets if active
+    if (this._sssEffect) {
+      this._sssEffect.resize(w * this.renderer.getPixelRatio(), h * this.renderer.getPixelRatio());
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -1727,6 +1769,125 @@ export class FaceRenderer {
 
     this.scene = null;
     this.camera = null;
+  }
+
+  // -----------------------------------------------------------------------
+  // SSS (Subsurface Scattering) Post-Processing
+  // -----------------------------------------------------------------------
+
+  /**
+   * Enable screen-space subsurface scattering.
+   * Dynamically imports SSSEffect on first call.
+   *
+   * @param {boolean} [enabled=true]
+   * @param {object} [options]
+   * @param {number} [options.sssWidth=0.012] - Scatter radius
+   */
+  async enableSSS(enabled = true, options = {}) {
+    if (enabled && !this._sssEffect) {
+      try {
+        const { SSSEffect } = await import('./shaders/SSSPass.js');
+        this._sssEffect = new SSSEffect(this.renderer, this.scene, this.camera, {
+          sssWidth: options.sssWidth ?? 0.012,
+          enabled: true,
+        });
+        console.log('FaceRenderer: SSS post-processing enabled');
+      } catch (err) {
+        console.warn('FaceRenderer: Failed to load SSS effect:', err);
+        return;
+      }
+    }
+
+    if (this._sssEffect) {
+      this._sssEffect.setEnabled(enabled);
+      if (options.sssWidth !== undefined) {
+        this._sssEffect.setWidth(options.sssWidth);
+      }
+    }
+  }
+
+  /**
+   * Disable SSS and dispose GPU resources.
+   */
+  disableSSS() {
+    if (this._sssEffect) {
+      this._sssEffect.dispose();
+      this._sssEffect = null;
+      console.log('FaceRenderer: SSS post-processing disabled');
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Treatment Preview Animation (Morph Lerp)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Animate from current morph state to a target state over time.
+   *
+   * @param {Object} targetMorphState - Target morph state { region: { inflate, ... } }
+   * @param {Object} regions - Region vertex index maps
+   * @param {object} [options]
+   * @param {number} [options.duration=500] - Animation duration in ms
+   * @param {Function} [options.onComplete] - Called when animation finishes
+   */
+  animateMorphTo(targetMorphState, regions, options = {}) {
+    const duration = options.duration ?? 500;
+    const onComplete = options.onComplete ?? null;
+
+    // Capture the current positions as "from" state
+    if (!this.faceMesh) return;
+    const posAttr = this.faceMesh.geometry.attributes.position;
+    const fromPositions = new Float32Array(posAttr.array);
+
+    // Apply target morph state to get "to" positions
+    this.resetDeformation();
+    this.applyMorphState(targetMorphState, regions);
+    const toPositions = new Float32Array(posAttr.array);
+
+    // Reset back to "from" positions to start animation
+    posAttr.array.set(fromPositions);
+    posAttr.needsUpdate = true;
+
+    // Animation state
+    const startTime = performance.now();
+    this._morphAnimation = {
+      from: fromPositions,
+      to: toPositions,
+      startTime,
+      duration,
+      onComplete,
+    };
+  }
+
+  /**
+   * Called from _update() to advance morph animation.
+   */
+  _updateMorphAnimation() {
+    const anim = this._morphAnimation;
+    if (!anim || !this.faceMesh) return;
+
+    const elapsed = performance.now() - anim.startTime;
+    let t = Math.min(1, elapsed / anim.duration);
+
+    // Smooth easing: ease-in-out cubic
+    t = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+    const posAttr = this.faceMesh.geometry.attributes.position;
+    const arr = posAttr.array;
+    const from = anim.from;
+    const to = anim.to;
+
+    for (let i = 0; i < arr.length; i++) {
+      arr[i] = from[i] + (to[i] - from[i]) * t;
+    }
+
+    posAttr.needsUpdate = true;
+    this.faceMesh.geometry.computeVertexNormals();
+
+    if (t >= 1) {
+      this._morphAnimation = null;
+      anim.onComplete?.();
+    }
   }
 }
 
