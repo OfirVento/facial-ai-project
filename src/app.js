@@ -496,9 +496,6 @@ You can now modify specific regions — try saying "make my nose thinner" or use
           }
         }
 
-        // ===== DIAGNOSTIC: Show debug panel with overlays =====
-        this._showTextureDebugPanel(this.photoUploader);
-
         // Expert diagnostics: toggle buttons available but NOT auto-shown
         this._addExpertDiagButtons(this.photoUploader);
 
@@ -1326,49 +1323,6 @@ You can now modify specific regions — try saying "make my nose thinner" or use
       this._addMessage('system', 'Something went wrong. Please try again.');
       console.error(err);
     }
-  }
-
-  // -----------------------------------------------------------------------
-  // DIAGNOSTIC: Debug panel for texture projection
-  // -----------------------------------------------------------------------
-
-  _showTextureDebugPanel(uploader) {
-    // Remove old panel if present
-    document.getElementById('texture-debug-panel')?.remove();
-
-    const panel = document.createElement('div');
-    panel.id = 'texture-debug-panel';
-    panel.style.cssText = `
-      position:fixed; bottom:0; left:0; right:0; z-index:10000;
-      background:#111; border-top:2px solid #f80; padding:10px;
-      display:flex; gap:12px; overflow-x:auto; max-height:45vh;
-    `;
-
-    const makeSection = (title, dataUrl) => {
-      if (!dataUrl) return '';
-      return `<div style="flex-shrink:0;text-align:center">
-        <div style="color:#ff0;font-size:11px;margin-bottom:4px;font-family:monospace">${title}</div>
-        <img src="${dataUrl}" style="max-height:35vh;border:1px solid #555;image-rendering:pixelated" />
-      </div>`;
-    };
-
-    let html = '';
-    html += makeSection('TEST 1a: Photo + Landmarks', uploader._debugPhotoLandmarks);
-    html += makeSection('TEST 1b: UV Atlas + Points', uploader._debugUVLandmarks);
-    html += makeSection('TEST 2a: Texture (pre-fill)', uploader._debugPreFillTexture);
-    html += makeSection('TEST 2b: Texture (final)', uploader._debugFinalTexture);
-
-    // Close button
-    html += `<div style="flex-shrink:0;display:flex;align-items:center">
-      <button onclick="this.closest('#texture-debug-panel').remove()"
-        style="padding:8px 16px;background:#800;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px">
-        ✕ Close
-      </button>
-    </div>`;
-
-    panel.innerHTML = html;
-    document.body.appendChild(panel);
-    console.log('PhotoUploader DIAG: Debug panel displayed');
   }
 
   // -----------------------------------------------------------------------
